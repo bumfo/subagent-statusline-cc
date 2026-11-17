@@ -85,7 +85,10 @@ export function host(options: Record<string, unknown> = {}) {
       CLAUDE_PROJECT_DIR: '/project', CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'session-1',
       CLAUDE_PLUGIN_ROOT: '/plugin', CLAUDE_PLUGIN_DATA: '/plugin-data',
     },
-    decorations: {} as Decorations, writes: 0, listReads: 0, drawing: 0,
+    decorations: {} as Decorations, writes: 0, version: 0, listReads: 0, drawing: 0,
+    sessionId: 'session-1', stateReads: 0,
+    beforeRead: undefined as (() => Promise<void>) | undefined,
+    beforeSet: undefined as ((value: Decorations) => Promise<void>) | undefined,
     logs: [] as string[], listError: undefined as Error | undefined,
     settingsError: undefined as Error | undefined,
     hookError: undefined as Error | undefined,
@@ -93,8 +96,8 @@ export function host(options: Record<string, unknown> = {}) {
     coreNode: Object.freeze({ host: 'AgentRow', identity: Symbol('host row') }),
     forwarded: [] as Row[],
     api: undefined as unknown as EngineInterface,
-    async event(name: string) {
-      const event = row()
+    async event(name: string, data: Record<string, unknown> = {}) {
+      const event = { ...row(), reason: 'other', sessionId: h.sessionId, ...data }
       return callbacks.get(name)?.(h.api, event, e => e)
     },
     async draw(event = row()) {
@@ -117,7 +120,7 @@ export function host(options: Record<string, unknown> = {}) {
     } },
     clock: h.clock,
     session: {
-      id: async () => 'session-1', cwd: async () => '/session-cwd',
+      id: async () => h.sessionId, cwd: async () => '/session-cwd',
       info: async () => h.info,
     },
     settings: { read: async ({ source }: { source: string }) => {
@@ -136,16 +139,25 @@ export function host(options: Record<string, unknown> = {}) {
       },
     },
     state: {
-      get: async () => ({ value: h.decorations }),
-      set: async (_: unknown, value: Decorations) => {
+      get: async () => {
+        h.stateReads++
+        const read = { value: h.decorations, version: h.version }
+        await h.beforeRead?.()
+        return read
+      },
+      set: async (_: unknown, value: Decorations, options?: { ifVersion?: number }) => {
         if (h.drawing) throw new Error('state.set: denied while drawing')
-        h.writes++; h.decorations = value
+        await h.beforeSet?.(value)
+        if (options?.ifVersion !== undefined && options.ifVersion !== h.version)
+          return { isSet: false, version: h.version }
+        h.writes++; h.decorations = value; h.version++
+        return { isSet: true, version: h.version }
       },
     },
     ui: { log: (message: string) => { h.logs.push(message) } },
   } as unknown as EngineInterface
   register(((name: string, ...args: unknown[]) => {
     callbacks.set(name, args[args.length - 1] as Handler)
-  }) as Parameters<typeof register>[0], options)
+  }) as Parameters<typeof register>[0], { command: 'fixture-command', ...options })
   return h
 }

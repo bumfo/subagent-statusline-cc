@@ -22,9 +22,10 @@ describe('command input and execution', () => {
         description: 'task b', label: 'task b', startTime: 1000, tokenCount: 0, tokenSamples: [0], cwd: '/session-cwd',
       }],
     })
-    expect(h.calls[0]).toEqual({ at: 300, argv: ['/bin/sh', '-c', 'legacy-command'], init: {
+    expect(h.calls[0]).toEqual({ at: 300, argv: ['/bin/sh', '-c', 'fixture-command'], init: {
       cwd: '/config-root', timeoutMs: 5000, stdin: JSON.stringify(h.input()), env: {
         CLAUDE_PROJECT_DIR: '/project', CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'session-1',
+        CLAUDE_PLUGIN_ROOT: '/plugin', CLAUDE_PLUGIN_DATA: '/plugin-data',
       },
     } })
     expect(h.env.CLAUDE_PLUGIN_ROOT).toBe('/plugin') // Never mutate the host environment.
@@ -54,11 +55,11 @@ describe('command input and execution', () => {
     await h.clock.advance(300)
     expect(h.calls[0]!.argv[2]).toBe('  echo "${CLAUDE_PLUGIN_ROOT}"  ')
     expect(h.calls[0]!.init.env).toEqual(h.env)
-    expect(h.settingsReads).toEqual(['policy', 'policy'])
+    expect(h.settingsReads.every(source => source === 'policy')).toBe(true)
   })
 
-  test.each(['${CLAUDE_PLUGIN_ROOT}', '${CLAUDE_PLUGIN_DATA}'])('unowned legacy %s is refused', async variable => {
-    const h = host()
+  test.each(['${CLAUDE_PLUGIN_ROOT}', '${CLAUDE_PLUGIN_DATA}', '$CLAUDE_PLUGIN_ROOT', '$CLAUDE_PLUGIN_DATA'])('legacy %s belongs to the host, not a second runner', async variable => {
+    const h = host({ command: '' })
     h.user.subagentStatusLine = { type: 'command', command: `echo "${variable}"` }
     await h.start()
     await h.clock.advance(10000)
@@ -67,7 +68,7 @@ describe('command input and execution', () => {
 
   test.each([undefined, null, {}, { type: 'prompt', command: 'no' }, { type: 'command', command: 42 }])(
     'missing or invalid legacy config never spawns: %j', async config => {
-      const h = host()
+      const h = host({ command: '' })
       h.user.subagentStatusLine = config
       await h.start()
       await h.clock.advance(5000)
@@ -75,12 +76,12 @@ describe('command input and execution', () => {
     },
   )
 
-  test('empty legacy command is valid, unlike an unset command', async () => {
+  test('empty legacy command remains host-owned', async () => {
     const h = host({ command: ' ' })
     h.user.subagentStatusLine = { type: 'command', command: '' }
     await h.start()
     await h.clock.advance(300)
-    expect(h.calls[0]!.argv).toEqual(['/bin/sh', '-c', ''])
+    expect(h.calls).toHaveLength(0)
   })
 
   test('policy overrides options and user settings; project settings are never read', async () => {
@@ -88,9 +89,8 @@ describe('command input and execution', () => {
     h.policy = { allowManagedHooksOnly: true, subagentStatusLine: { type: 'command', command: 'policy-command' } }
     await h.start()
     await h.clock.advance(300)
-    expect(h.calls[0]!.argv[2]).toBe('policy-command')
-    expect(h.settingsReads).toEqual(['policy', 'policy'])
-    expect(h.calls[0]!.init.env).not.toHaveProperty('CLAUDE_PLUGIN_ROOT')
+    expect(h.calls).toHaveLength(0)
+    expect(h.settingsReads.every(source => source === 'policy')).toBe(true)
   })
 
   test.each([{ disableAllHooks: true }, { allowManagedHooksOnly: true }])('policy disables non-managed command: %j', async policy => {
@@ -107,8 +107,9 @@ describe('native refresh lifecycle', () => {
     const h = host()
     h.agents.push(agent('b'))
     await h.event('session.start')
+    const reads = h.listReads
     await Promise.all([h.draw(row()), h.draw(row('b'))])
-    expect(h.listReads).toBe(1)
+    expect(h.listReads - reads).toBe(1)
     await h.clock.advance(299)
     expect(h.calls).toHaveLength(0)
     await h.clock.advance(1)
@@ -191,21 +192,21 @@ describe('native refresh lifecycle', () => {
     const h = host()
     await h.start()
     await h.clock.advance(300)
-    h.user = {}
+    h.policy.disableAllHooks = true
     await h.draw()
     expect(h.forwarded.at(-1)!.props).not.toHaveProperty('body')
     await h.clock.advance(0)
     expect(h.clock.timers.size).toBe(0)
     expect(h.decorations).toEqual({})
-    h.user = { subagentStatusLine: { type: 'command', command: 'new' } }
+    h.policy = {}
     await h.draw()
     await h.clock.advance(300)
-    expect(h.calls[1]!.argv[2]).toBe('new')
+    expect(h.calls[1]!.argv[2]).toBe('fixture-command')
     expect(h.input().tasks[0].tokenSamples).toEqual([1234, 1234])
   })
 
   test('no command means no idle polling, even with eligible rows', async () => {
-    const h = host()
+    const h = host({ command: '' })
     h.user = {}
     await h.start()
     await h.clock.advance(60000)
@@ -213,17 +214,17 @@ describe('native refresh lifecycle', () => {
     expect(h.calls).toHaveLength(0)
   })
 
-  test('periodic refresh picks up a changed command without an extra immediate run', async () => {
+  test('periodic refresh rechecks policy without an unrelated draw', async () => {
     const h = host()
     await h.start()
     await h.clock.advance(300)
-    h.user.subagentStatusLine = { type: 'command', command: 'replacement' }
+    h.user.subagentStatusLine = { type: 'command', command: 'does-not-override-own' }
     await h.draw()
     await h.clock.advance(300)
     expect(h.calls).toHaveLength(1)
     await h.clock.advance(4400)
-    expect(h.calls[1]!.argv[2]).toBe('replacement')
-    h.user = {}
+    expect(h.calls[1]!.argv[2]).toBe('fixture-command')
+    h.policy.disableAllHooks = true
     await h.clock.advance(5000)
     expect(h.calls).toHaveLength(2)
     expect(h.clock.timers.size).toBe(0)
@@ -398,7 +399,7 @@ describe('AgentRow output delegation', () => {
   })
 
   test.each([{ body: 'native' }, { isHidden: true }])('native ownership prevents duplicate execution: %j', async props => {
-    const h = host()
+    const h = host({ command: '' })
     await h.start()
     const event = row('a', props)
     await h.draw(event)
@@ -422,7 +423,7 @@ describe('AgentRow output delegation', () => {
     await h.start()
     await h.clock.advance(10000)
     expect(h.calls).toHaveLength(3)
-    expect(h.writes).toBe(1)
+    expect(h.writes).toBe(2) // Forced session reset, then one changed output.
   })
 
   test('nonterminal surfaces use the same command and host row', async () => {
@@ -440,11 +441,13 @@ describe('AgentRow output delegation', () => {
     const h = host()
     await h.start()
     await h.clock.advance(300)
+    h.policy.subagentStatusLine = { type: 'command', command: 'managed' }
     await h.draw(row('a', { body: 'native' }))
     await h.clock.advance(0)
     expect(h.decorations).toEqual({})
     await h.draw(row('a', { body: 'native' }))
     expect(h.logs).toEqual([])
+    h.policy = {}
     await h.draw(row())
     await h.clock.advance(300)
     expect(h.decorations).toEqual({ a: 'decorated' })
@@ -473,5 +476,115 @@ describe('AgentRow output delegation', () => {
     await h.draw(row('b', { isHidden: false }))
     await h.clock.advance(4700)
     expect(h.calls).toHaveLength(2)
+  })
+})
+
+describe('reviewed lifecycle boundaries', () => {
+  test.each(['clear', 'resume'])('%s recovers under the new session id without session.start or a draw', async reason => {
+    const h = host()
+    await h.start()
+    await h.clock.advance(300)
+    await h.event('session.end', { reason })
+    await h.clock.advance(300)
+    expect(h.calls).toHaveLength(1) // Never restart in the ending session.
+    h.sessionId = 'session-2'
+    h.agents = [agent('b')]
+    h.answer = () => output('new session', 'b')
+    await h.clock.advance(600)
+    expect(h.calls).toHaveLength(2)
+    expect(h.input().session_id).toBe('session-2')
+    expect(h.input().tasks[0].tokenSamples).toEqual([1234])
+    expect(h.decorations).toEqual({ b: 'new session' })
+  })
+
+  test('legacy command is never duplicated before its first native body arrives', async () => {
+    const h = host({ command: '' })
+    await h.start()
+    await h.clock.advance(10000)
+    expect(h.calls).toHaveLength(0)
+    await h.draw(row('a', { body: 'host output' }))
+    h.agents.push(agent('b'))
+    await h.draw(row('b'))
+    await h.clock.advance(10000)
+    expect(h.calls).toHaveLength(0)
+  })
+
+  test('disabled rows still subscribe; a settings event restarts refresh without a draw', async () => {
+    const h = host()
+    h.policy.disableAllHooks = true
+    await h.start()
+    expect(h.stateReads).toBeGreaterThan(1)
+    h.policy = {}
+    await h.event('settings.read')
+    await h.clock.advance(300)
+    expect(h.decorations).toEqual({ a: 'decorated' })
+  })
+
+  test('session start discovers existing rows without a draw', async () => {
+    const h = host()
+    await h.event('session.start')
+    await h.clock.advance(300)
+    expect(h.calls).toHaveLength(1)
+  })
+
+  test('a turn discovers newly appearing rows without a draw', async () => {
+    const h = host()
+    h.agents = []
+    await h.event('session.start')
+    h.agents = [agent()]
+    await h.event('turn.start')
+    await h.clock.advance(300)
+    expect(h.calls).toHaveLength(1)
+  })
+
+  test('desktop and vscode widths cannot flap the debounce; measured roots beat missing widths', async () => {
+    const h = host()
+    h.agents.push(agent('b'))
+    await h.event('session.start')
+    for (let i = 0; i < 100; i++) {
+      await h.draw({ ...row('b', { columns: 81 }), surface: 'desktop' })
+      await h.draw({ ...row('b', { columns: 55 }), surface: 'vscode' })
+      await h.clock.advance(100)
+    }
+    expect(h.calls.map(call => call.at)).toEqual([300, 5000, 10000])
+    expect(h.calls.map(call => JSON.parse(call.init.stdin).columns)).toEqual([81, 81, 81])
+    await h.event('session.detach', { surface: 'desktop' })
+    await h.clock.advance(300)
+    expect(h.input().columns).toBe(55)
+  })
+
+  test.each(['read', 'set'])('clear rejects stale output delayed inside state.%s', async boundary => {
+    const h = host()
+    const pending = deferred<void>()
+    await h.start()
+    if (boundary === 'read') h.beforeRead = async () => { h.beforeRead = undefined; await pending.promise }
+    else h.beforeSet = async value => { if (value.a) { h.beforeSet = undefined; await pending.promise } }
+    await h.clock.advance(300)
+    await h.event('session.end', { reason: 'clear' })
+    h.sessionId = 'session-2'
+    pending.resolve()
+    await flush()
+    expect(h.decorations).toEqual({})
+    h.answer = () => output('fresh')
+    await h.clock.advance(300)
+    expect(h.decorations).toEqual({ a: 'fresh' })
+    expect(h.input().tasks[0].tokenSamples).toEqual([1234])
+  })
+
+  test('a clear retries when an already-dispatched publication wins its CAS', async () => {
+    const h = host()
+    const publish = deferred<void>()
+    const clearRead = deferred<void>()
+    await h.start()
+    h.beforeSet = async value => { if (value.a) { h.beforeSet = undefined; await publish.promise } }
+    await h.clock.advance(300)
+    h.beforeRead = async () => { h.beforeRead = undefined; await clearRead.promise }
+    const clearing = h.event('session.end', { reason: 'clear' })
+    await flush()
+    publish.resolve()
+    await flush()
+    clearRead.resolve()
+    await clearing
+    expect(h.decorations).toEqual({})
   })
 })

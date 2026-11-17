@@ -28,14 +28,16 @@ export function engine(on: On) {
     calls: [] as { at: number; argv: readonly string[]; init: Record<string, any> }[],
     reads: [] as string[], forwarded: [] as RenderPropsOf['AgentRow'][],
     writes: [] as unknown[],
+    sessionId: 'session-1',
     core: false,
     logs: [] as string[],
     answer: (() => output()) as () => ReturnType<typeof output> | Promise<ReturnType<typeof output>>,
   }
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('session.end', () => ({ sessionId: 'session-1' }))
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+  on('turn.start', () => ({ turnId: 'turn-1' }))
   on('agent.list', () => ({ value: fixture.agents }))
-  on('session.id', () => ({ value: 'session-1' }))
+  on('session.id', () => ({ value: fixture.sessionId }))
   on('session.cwd', () => ({ value: '/session-cwd' }))
   on('session.info', () => ({ value: {
     transcriptPath: '/transcripts/session-1.jsonl', scratchpadDir: '/scratch',
@@ -49,6 +51,7 @@ export function engine(on: On) {
     fixture.reads.push(e.source ?? 'merged')
     if (e.source === 'policy') return { value: fixture.policy }
     if (e.source === 'user') return { value: fixture.user }
+    if (e.source === undefined) return { value: { ...fixture.user, ...fixture.policy } }
     throw new Error(`Unexpected settings source: ${String(e.source)}`)
   })
   on('process.run', async (_, e) => {

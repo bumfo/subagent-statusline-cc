@@ -1,5 +1,11 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, test as kitTest } from 'claude-code/testing'
 import { agent, deferred, engine, output, row, textOf } from './engine'
+
+// Ordinary contract cases exercise a mod-owned command. Legacy ownership is
+// tested explicitly below, not simulated as if the host stopped running it.
+const test: typeof kitTest = (name: string, ...args: any[]) => args.length === 1
+  ? kitTest(name, { options: { command: 'fixture-command' } }, args[0])
+  : kitTest(name, args[0], args[1])
 
 // Integration through the official kit. This file imports no process, fs,
 // Bun or test-runner replacement and never invokes a Claude executable.
@@ -9,18 +15,18 @@ test('disabling the command clears outside drawing and immediately delegates the
   const ui = await $.ui.mount(row())
   await h.clock.advance(300)
   expect(await textOf(ui)).toBe('decorated')
-  h.user = {}
+  h.policy.disableAllHooks = true
   await ui.redraw()
   expect(await textOf(ui)).toBe('engine columns')
   await h.clock.settle()
   expect(h.writes[h.writes.length - 1]).toEqual({})
   await h.clock.advance(10000)
   expect(h.calls).toHaveLength(1)
-  h.user = { subagentStatusLine: { type: 'command', command: 'again' } }
+  h.policy = {}
   await ui.redraw()
   await h.clock.advance(300)
   expect(await textOf(ui)).toBe('decorated')
-  expect(h.calls[1]?.argv).toEqual(['/bin/sh', '-c', 'again'])
+  expect(h.calls[1]?.argv).toEqual(['/bin/sh', '-c', 'fixture-command'])
 })
 
 for (const props of [{ body: 'native' }, { isHidden: true }]) {
@@ -29,12 +35,14 @@ for (const props of [{ body: 'native' }, { isHidden: true }]) {
     const ui = await $.ui.mount(row())
     await h.clock.advance(300)
     expect(await textOf(ui)).toBe('decorated')
+    h.policy.subagentStatusLine = { type: 'command', command: 'managed' }
     for (let i = 0; i < 3; i++) await ui.redraw(row('a', props).props)
     await h.clock.settle()
     expect(await textOf(ui)).toBe('body' in props ? 'native' : 'hidden')
     expect(h.writes[h.writes.length - 1]).toEqual({})
     await h.clock.advance(10000)
     expect(h.calls).toHaveLength(1)
+    h.policy = {}
     await ui.redraw(row().props)
     await h.clock.advance(300)
     expect(await textOf(ui)).toBe('decorated')
@@ -90,10 +98,10 @@ test('native 322 input preserves all fields, command environment and body width'
   await h.clock.advance(300)
   expect(h.calls).toHaveLength(1)
   const call = h.calls[0]!
-  expect(call.argv).toEqual(['/bin/sh', '-c', 'legacy-command'])
+  expect(call.argv).toEqual(['/bin/sh', '-c', 'fixture-command'])
   expect(call.init.cwd).toBe('/config-root')
   expect(call.init.timeoutMs).toBe(5000)
-  expect(call.init.env).toEqual({ CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'session-1', CLAUDE_PROJECT_DIR: '/project' })
+  expect(call.init.env).toEqual({ CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'session-1', CLAUDE_PROJECT_DIR: '/project', CLAUDE_PLUGIN_ROOT: '/plugin', CLAUDE_PLUGIN_DATA: '/plugin-data' })
   expect(JSON.parse(call.init.stdin)).toEqual({
     session_id: 'session-1', transcript_path: '/transcripts/session-1.jsonl', cwd: '/session-cwd',
     scratchpad_dir: '/scratch', prompt_id: 'prompt-1', agent_type: 'main', columns: 90,
@@ -139,16 +147,16 @@ test('native 322 retained completed rows keep refreshing; eviction stops the tim
   expect(await textOf(ui)).toBe('engine columns')
 })
 
-test('native 322 empty legacy command is present, while an unset command never runs', async ($, on) => {
+test('empty and unset legacy commands never start a duplicate runner', { options: { command: '' } }, async ($, on) => {
   const h = engine(on)
   h.user = { subagentStatusLine: { type: 'command', command: '' } }
   const ui = await $.ui.mount(row())
   await h.clock.advance(300)
-  expect(h.calls[0]?.argv).toEqual(['/bin/sh', '-c', ''])
+  expect(h.calls).toHaveLength(0)
   h.user = {}
   await ui.redraw()
   await h.clock.advance(10000)
-  expect(h.calls).toHaveLength(1)
+  expect(h.calls).toHaveLength(0)
 })
 
 for (const policy of [{ disableAllHooks: true }, { allowManagedHooksOnly: true }]) {
@@ -169,13 +177,12 @@ test('native 322 status-line disableAllHooks gate is policy-only, not user setti
   expect(h.calls).toHaveLength(1)
 })
 
-test('policy command overrides the mod option without acquiring mod provenance', { options: { command: 'own' } }, async ($, on) => {
+test('policy command overrides the mod option and is delegated to the host', { options: { command: 'own' } }, async ($, on) => {
   const h = engine(on)
   h.policy = { subagentStatusLine: { type: 'command', command: 'policy' } }
   await $.ui.mount(row())
   await h.clock.advance(300)
-  expect(h.calls[0]?.argv[2]).toBe('policy')
-  expect(h.calls[0]?.init.env.CLAUDE_PLUGIN_ROOT).toBe(undefined)
+  expect(h.calls).toHaveLength(0)
   expect(h.reads.every(source => source === 'policy')).toBe(true)
 })
 
@@ -270,3 +277,121 @@ test('task removal while a command is in flight leaves no stale state or continu
   await h.clock.advance(10000)
   expect(h.calls).toHaveLength(1)
 })
+
+for (const reason of ['clear', 'resume'] as const) {
+  test(`${reason} restarts under a new session id without another session.start`, async ($, on) => {
+    const h = engine(on)
+    const ui = await $.ui.mount(row())
+    await h.clock.advance(300)
+    await $.session.end({ reason, sessionId: 'session-1', resume: { id: 'session-1' } })
+    await h.clock.advance(300)
+    expect(h.calls).toHaveLength(1)
+    h.sessionId = 'session-2'
+    h.answer = () => output('new session')
+    await h.clock.advance(600)
+    expect(h.calls).toHaveLength(2)
+    expect(JSON.parse(h.calls[1]!.init.stdin).session_id).toBe('session-2')
+    expect(JSON.parse(h.calls[1]!.init.stdin).tasks[0].tokenSamples).toEqual([1234])
+    expect(await textOf(ui)).toBe('new session')
+  })
+}
+
+test('legacy execution is delegated before any native body and while another row first appears', { options: { command: '' } }, async ($, on) => {
+  const h = engine(on)
+  const a = await $.ui.mount(row())
+  await h.clock.advance(10000)
+  expect(h.calls).toHaveLength(0)
+  await a.redraw(row('a', { body: 'host output' }).props)
+  h.agents.push(agent('b'))
+  const b = await $.ui.mount(row('b'))
+  await h.clock.advance(10000)
+  expect(await textOf(a)).toBe('host output')
+  expect(await textOf(b)).toBe('engine columns')
+  expect(h.calls).toHaveLength(0)
+})
+
+test('managed command ownership wins over an explicit mod option before the native body arrives', async ($, on) => {
+  const h = engine(on)
+  h.policy.subagentStatusLine = { type: 'command', command: 'managed' }
+  const ui = await $.ui.mount(row())
+  await h.clock.advance(10000)
+  expect(h.calls).toHaveLength(0)
+  await ui.redraw(row('a', { body: 'managed output' }).props)
+  expect(await textOf(ui)).toBe('managed output')
+})
+
+test('a disabled mounted row subscribes and shows newly enabled output without a manual redraw', {
+  options: { command: 'fixture-command' },
+  plugins: [{ name: 'settings-refresh-fixture', register(on) {
+    on('session.stop', async ($, e, next) => {
+      await $.settings.read()
+      return next(e)
+    })
+  } }],
+}, async ($, on) => {
+  const h = engine(on)
+  on('session.stop', (_, e) => ({ isTurnRunning: e.isTurnRunning }))
+  h.policy.disableAllHooks = true
+  const ui = await $.ui.mount(row())
+  expect(await textOf(ui)).toBe('engine columns')
+  h.policy = {}
+  await $.session.stop({ isTurnRunning: false })
+  await h.clock.advance(300)
+  expect(await textOf(ui)).toBe('decorated')
+})
+
+test('session start and a later turn discover rows without any UI mount', async ($, on) => {
+  const h = engine(on)
+  await $.session.start({ cwd: '/session-cwd', surface: 'terminal', isInteractive: true })
+  await h.clock.advance(300)
+  expect(h.calls).toHaveLength(1)
+  h.agents = []
+  await h.clock.advance(4700)
+  h.agents = [agent('b')]
+  await $.turn.start({ text: '', turnId: 'turn-2', agentId: 'b' })
+  await h.clock.advance(300)
+  expect(h.calls).toHaveLength(2)
+  expect(JSON.parse(h.calls[1]!.init.stdin).tasks[0].id).toBe('b')
+})
+
+test('desktop/vscode redraws use one stable measured root even when the first root has no width', async ($, on) => {
+  const h = engine(on)
+  h.agents.push(agent('b'))
+  const desktop = await $.ui.mount(row('b', { columns: 81 }, 'desktop'))
+  const vscode = await $.ui.mount(row('b', { columns: 55 }, 'vscode'))
+  for (let i = 0; i < 100; i++) {
+    await desktop.redraw()
+    await vscode.redraw()
+    await h.clock.advance(100)
+  }
+  expect(h.calls.map(call => call.at)).toEqual([300, 5000, 10000])
+  expect(h.calls.map(call => JSON.parse(call.init.stdin).columns)).toEqual([81, 81, 81])
+})
+
+for (const boundary of ['read', 'set'] as const) {
+  test(`clear invalidates a publication paused inside state.${boundary}`, async ($, on) => {
+    const h = engine(on)
+    const pending = deferred<void>()
+    let armed = false
+    if (boundary === 'read') on('state.get', { plugin: 'subagent-statusline', key: 'decorations' }, async (_, e, next) => {
+      const result = await next(e)
+      if (armed) { armed = false; await pending.promise }
+      return result
+    })
+    else on('state.set', { plugin: 'subagent-statusline', key: 'decorations' }, async (_, e, next) => {
+      if (armed && e.value.a === 'stale') { armed = false; await pending.promise }
+      return next(e)
+    })
+    h.answer = () => { armed = true; return output('stale') }
+    const ui = await $.ui.mount(row())
+    await h.clock.advance(300)
+    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+    h.sessionId = 'session-2'
+    pending.resolve()
+    await h.clock.settle()
+    expect(await textOf(ui)).toBe('engine columns')
+    h.answer = () => output('fresh')
+    await h.clock.advance(5000)
+    expect(await textOf(ui)).toBe('fresh')
+  })
+}

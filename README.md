@@ -19,45 +19,55 @@ and click navigation in every terminal mode.
 
 ## Where the command comes from
 
-1. A managed-policy `subagentStatusLine` command, if configured. Policy
-   `disableAllHooks` blocks execution; `allowManagedHooksOnly` prevents fallback
-   to a user command.
+1. A managed-policy `subagentStatusLine` command, if configured, belongs to the
+   native host. The mod leaves those rows alone and does not run a second copy.
+   Policy `disableAllHooks` blocks execution; `allowManagedHooksOnly` prevents
+   running a user-owned mod command.
 2. The mod's `command` option (`pluginConfigs` in `~/.claude/settings.json`,
    or `/config`).
-3. Otherwise a `{ "type": "command", "command": "…" }` value under
-   `subagentStatusLine` in user settings. Project settings are never read for
-   shell commands.
+3. Without a mod command, a legacy `subagentStatusLine` in user settings stays
+   with the native host. Project settings are never read for shell commands.
 
-Without a `command` option, a row arriving with a body or hidden flag is left
-alone. If every eligible row is owned that way, the command stops. Ownership
-is reconsidered on each draw, not latched for the session: another mod hiding
-one row cannot permanently turn off the others. An explicit mod command may
-replace an inherited body or show an inherited hidden row.
+Ownership comes from the resolved command, not whether a row already has a
+body. Native output is asynchronous: a first/new row can have no body while
+the host's command is already running. Delegation begins before that first
+result, so no duplicate command or temporary replacement is produced. An
+explicit mod command may replace another mod's body or show its hidden row,
+unless managed policy owns the command.
 
 Commands in the mod's own option receive its `CLAUDE_PLUGIN_ROOT` and
-`CLAUDE_PLUGIN_DATA`. Legacy commands do not acquire this mod's identity;
-commands referencing `${CLAUDE_PLUGIN_ROOT}` or `${CLAUDE_PLUGIN_DATA}` there
-are refused. The host remains responsible for workspace trust and plugin
+`CLAUDE_PLUGIN_DATA`. The mod never executes legacy commands under its identity.
+On a future host that removes the legacy setting, move the command into this
+mod's option; it does not guess whether an unpopulated row means native support
+was removed. The host remains responsible for workspace trust and plugin
 execution permissions.
 
 ## Options
 
 | Option      | Default | Meaning                                                        |
 | ----------- | ------- | -------------------------------------------------------------- |
-| `command`   | `""`    | Shell command, run with `/bin/sh -c`. Empty: use the legacy key. |
+| `command`   | `""`    | Shell command, run with `/bin/sh -c`. Empty: leave legacy execution to the host. |
 | `refreshMs` | `5000`  | Periodic refresh while eligible rows exist, including completed rows. Minimum 1000 ms. |
 
 The first run is debounced by 300 ms. A producer-count or body-width change
 restarts that debounce and the periodic timer; a status change alone does not.
 Commands have a 5-second timeout and never overlap. Results from an obsolete
 refresh are discarded. Timers stop when no eligible rows or command remain,
-and when the session ends. A custom `refreshMs` is a mod extension; use the
+and when the process exits. `/clear` and in-process resume cancel old work and
+restart after the session id changes, without needing another `session.start`.
+A custom `refreshMs` is a mod extension; use the
 default for native timing.
 
 The draw hook never writes UI state. Disabling or delegating a row immediately
 returns the host's row and schedules any clearing through a zero-delay clock
-callback. One root row supplies the shared body width; narrower nested rows
-and remote-surface redraws do not repeatedly reset the command timers.
+callback. Every mounted row subscribes even while disabled, so later output
+can redraw it. A measured root supplies the shared body width, preferring the
+terminal then a stable remote-surface order; an unmeasured first root cannot
+discard another row's measurement. Narrower nested rows and competing surfaces
+do not repeatedly reset the command timers. Session startup, merged settings
+reads and new turns also discover work without waiting for a row redraw.
+Publication checks its lifecycle generation after reading state and uses a
+versioned write, so a delayed old result cannot overwrite a clear.
 
 ## stdin
 
@@ -146,8 +156,8 @@ claude plugin install subagent-statusline@subagent-statusline-cc
 
 2. Start a new session, run a subagent, and check its row.
 3. Back up `~/.claude/settings.json`, then delete the `subagentStatusLine` key.
-   Delete it last: until the mod has its own `command`, that key is where the
-   mod reads the command from.
+   Delete it last: until the mod has its own `command`, the native host still
+   owns that key. Managed legacy settings must be migrated by their administrator.
 
 To load a working copy without installing it, set
 `"CLAUDE_CODE_PLUGIN_DIRS": "/path/to/subagent-statusline-cc"` in the settings
@@ -183,6 +193,13 @@ enforces render-time restrictions, state updates and timer callbacks. Cases
 cover the reviewed disabling/native-takeover paths, repeated draws, multiple
 widths, hidden-row composition, all four surfaces, command input/provenance,
 policy precedence, sampling, retained completed rows, failures and cancellation.
+They also cover clear/resume without another start, first-body native ownership,
+disabled-row subscriptions, redraw-free discovery, multiple remote widths, and
+publications suspended inside state reads/writes.
+
+`tsconfig.json` covers the host module and official-kit tests using the SDK types
+generated when Claude Code loads the mod. It deliberately excludes `checks/`,
+whose Bun/Node APIs belong to the separate binary-free development runner.
 
 Both suites test command contracts and UI delegation, not terminal
 pixels. Neither copies the renderer. ANSI integration coverage passes the body
@@ -197,7 +214,7 @@ the integration suite:
 | --- | --- |
 | A pending command can delay a new agent's refresh until the next 5-second tick | The 300 ms callback skips while a command is busy. An obsolete result is discarded. |
 | Retained completed rows continue refreshing | Refreshes stop when no eligible rows remain, not merely when nothing is running. |
-| An empty legacy command is present | An empty string runs as a command; an unset command does not. |
+| A legacy command, even an empty one, belongs to the host | The mod never starts a duplicate runner; use its `command` option for mod-owned execution. |
 | `disableAllHooks` is policy-only for this status-line path | Managed policy controls the gate. Project commands remain excluded. |
 | Samples belong to refreshes | Each task receives its latest 16 refresh samples, rather than the public `AgentInfo.tokenSamples` history, which has a different sampling lifetime. |
 

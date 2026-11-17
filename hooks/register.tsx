@@ -1,4 +1,4 @@
-import type { AgentInfo, EngineInterface, Register } from 'claude-code'
+import type { AgentInfo, EngineInterface, Register, RenderSurface } from 'claude-code'
 
 import type { Decorations } from '../types'
 
@@ -16,16 +16,17 @@ type Live = {
   columns: number
   count: number
   generation: number
+  scope: number
   busy: boolean
   enabled: boolean
   ended: boolean
-  native: boolean
+  suspendedId?: string
   clear?: Timer
+  wake?: Timer
   initial?: Timer
   periodic?: Timer
   listing?: Promise<AgentInfo[]>
-  owned: Set<string>
-  widths: Map<string, { columns: number; terminal: boolean }>
+  widths: Map<RenderSurface, Map<string, number>>
   samples: Map<string, number[]>
 }
 
@@ -38,71 +39,67 @@ export const register: Register = (on, options) => {
     columns: 0,
     count: 0,
     generation: 0,
+    scope: 0,
     busy: false,
     enabled: false,
     ended: false,
-    native: false,
-    owned: new Set(),
     widths: new Map(),
     samples: new Map(),
   }
 
   on('session.start', async ($, e, next) => {
-    cancel(live)
+    reset(live)
     live.ended = false
-    live.native = false
-    live.count = 0
-    live.enabled = false
-    live.samples.clear()
-    live.owned.clear()
-    live.widths.clear()
-    await write($, {})
+    live.suspendedId = undefined
+    await write($, live, {}, live.generation, true)
+    await refresh($, live)
     return next(e)
   })
 
   on('session.end', async ($, e, next) => {
-    live.ended = true
-    cancel(live)
-    live.samples.clear()
-    await write($, {})
+    reset(live)
+    live.ended = e.reason !== 'clear' && e.reason !== 'resume'
+    live.suspendedId = live.ended ? undefined : e.sessionId
+    await write($, live, {}, live.generation, true)
+    const result = await next(e)
+    if (!live.ended) requestRefresh($, live)
+    return result
+  })
+
+  // These events restart discovery even if no AgentRow is redrawn. Settings
+  // reads of individual sources (including our own) must not create a loop.
+  on('settings.read', async ($, e, next) => {
+    const result = await next(e)
+    if (e.source === undefined) requestRefresh($, live)
+    return result
+  }).catch((_, e, next) => next(e))
+  on('turn.start', ($, e, next) => {
+    requestRefresh($, live)
+    return next(e)
+  })
+  on('session.detach', ($, e, next) => {
+    live.widths.delete(e.surface)
+    requestRefresh($, live)
     return next(e)
   })
 
   on('ui.render', { component: 'AgentRow' }, async ($, e, next) => {
-    if (live.ended) return next(e)
-    // A body/hidden flag may come from another mod, not only native settings.
-    // Delegate this row, never latch ownership for the rest of the session.
-    const owned = live.ownCommand.trim() === '' &&
-      (e.props.body !== undefined || e.props.isHidden)
-    if (owned) live.owned.add(e.props.id)
-    else live.owned.delete(e.props.id)
-    if (e.props.columns !== undefined &&
-      (e.surface === 'terminal' || !live.widths.get(e.props.id)?.terminal)) {
-      live.widths.set(e.props.id, {
-        columns: Math.max(0, e.props.columns), terminal: e.surface === 'terminal',
-      })
-    }
+    // Subscribe even while disabled or delegated: publishing later must redraw
+    // an already-mounted row, not wait for unrelated host activity.
+    const scope = live.scope
+    const { value } = await $.state.get(DECORATIONS)
+    if (!await enterSession($, live)) return next(e)
     try {
-      const rows = await agents($, live)
-      const ids = new Set(rows.map(row => row.id))
-      for (const id of live.owned) if (!ids.has(id)) live.owned.delete(id)
-      for (const id of live.widths.keys()) if (!ids.has(id)) live.widths.delete(id)
-      live.native = rows.length > 0 && rows.every(row => live.owned.has(row.id))
-      const enabled = rows.length > 0 && !live.native &&
-        (await resolveCommand($, live)) !== undefined
-      // Native has one viewport width, not the width of the last row drawn.
-      // Use the first eligible root's measurement, so nested/narrow rows and
-      // other attached surfaces cannot continually reset the shared timers.
-      const leader = rows.find(row => !row.parentId || !ids.has(row.parentId))
-      const columns = leader ? live.widths.get(leader.id)?.columns ?? live.columns : live.columns
-      if (!live.ended) {
-        await schedule($, live, rows.length, columns, enabled, true)
+      if (e.props.columns !== undefined) {
+        let widths = live.widths.get(e.surface)
+        if (!widths) live.widths.set(e.surface, widths = new Map())
+        widths.set(e.props.id, Math.max(0, e.props.columns))
       }
+      await refresh($, live, true)
     } catch (error) {
       $.ui.log(`subagent-statusline: row refresh failed: ${String(error)}`, { to: 'debug' })
     }
-    if (owned || live.native || !live.enabled) return next(e)
-    const { value } = await $.state.get(DECORATIONS)
+    if (scope !== live.scope || !live.enabled || live.ended || live.suspendedId !== undefined) return next(e)
     const body = value && Object.hasOwn(value, e.props.id) ? value[e.props.id] : undefined
     // Do not replace the node: the host's row keeps its pointer, ANSI handling,
     // truncation, hover and click behavior. requestId is not an agent identity.
@@ -110,6 +107,72 @@ export const register: Register = (on, options) => {
       ...e, props: { ...e.props, body: body === '' ? undefined : body, isHidden: body === '' },
     })
   })
+}
+
+function reset(live: Live): void {
+  cancel(live)
+  live.scope++
+  live.wake?.cancel()
+  live.wake = undefined
+  live.count = 0
+  live.columns = 0
+  live.enabled = false
+  live.samples.clear()
+  live.widths.clear()
+  live.listing = undefined
+}
+
+async function enterSession($: EngineInterface, live: Live): Promise<boolean> {
+  if (live.ended) return false
+  const ending = live.suspendedId
+  if (ending === undefined) return true
+  if (await $.session.id() === ending) return false
+  // /clear and in-process resume do not emit session.start. Their next session
+  // has new timer/sample/measurement ownership, without overlapping old work.
+  if (live.suspendedId === ending) {
+    reset(live)
+    live.suspendedId = undefined
+  }
+  return !live.ended && live.suspendedId === undefined
+}
+
+function requestRefresh($: EngineInterface, live: Live, delay = 0): void {
+  if (live.ended || live.wake) return
+  live.wake = $.clock.after(delay, () => {
+    live.wake = undefined
+    void refresh($, live).catch(error => {
+      $.ui.log(`subagent-statusline: refresh failed: ${String(error)}`, { to: 'debug' })
+    })
+  })
+}
+
+async function refresh($: EngineInterface, live: Live, drawing = false): Promise<void> {
+  if (!await enterSession($, live)) {
+    if (!live.ended) requestRefresh($, live, INITIAL_MS)
+    return
+  }
+  const generation = live.generation
+  const rows = await agents($, live)
+  const command = await resolveCommand($, live)
+  if (generation !== live.generation || live.ended) return
+  const ids = new Set(rows.map(row => row.id))
+  for (const widths of live.widths.values())
+    for (const id of widths.keys()) if (!ids.has(id)) widths.delete(id)
+  // Fixed surface priority, then a measured root. Neither attached surfaces nor
+  // an unmeasured first root may steal a known width on every draw.
+  let columns = live.columns
+  const surfaces = [...live.widths.keys()].sort((a, b) =>
+    a === 'terminal' ? -1 : b === 'terminal' ? 1 : a.localeCompare(b),
+  )
+  for (const surface of surfaces) {
+    const widths = live.widths.get(surface)!
+    const leader = rows.find(row => (!row.parentId || !ids.has(row.parentId)) && widths.has(row.id)) ??
+      rows.find(row => widths.has(row.id))
+    if (leader) { columns = widths.get(leader.id)!; break }
+  }
+  // Legacy/policy commands belong to the native host, even before its first
+  // asynchronous body arrives. Only a resolved mod-owned command is ours.
+  await schedule($, live, rows.length, columns, command?.own === true, drawing)
 }
 
 function cancel(live: Live): void {
@@ -151,15 +214,16 @@ async function schedule(
   live.enabled = enabled
   if (count === 0) live.samples.clear()
   if (count === 0 || !enabled) {
+    const generation = live.generation
     if (!drawing) {
-      await write($, {})
+      await write($, live, {}, generation, true)
       return
     }
     // schedule is also reached while drawing. State writes there are denied:
     // return the native row immediately, then clear from a timer context.
     live.clear = $.clock.after(0, () => {
       live.clear = undefined
-      void write($, {}).catch(error => {
+      void write($, live, {}, generation, true).catch(error => {
         $.ui.log(`subagent-statusline: clear failed: ${String(error)}`, { to: 'debug' })
       })
     })
@@ -171,11 +235,11 @@ async function schedule(
 }
 
 async function tick($: EngineInterface, live: Live, generation: number): Promise<void> {
-  if (live.busy || live.ended || live.native || generation !== live.generation) return
+  if (live.busy || live.ended || live.suspendedId !== undefined || generation !== live.generation) return
   live.busy = true
   try {
     const rows = await agents($, live)
-    if (live.ended || live.native || generation !== live.generation) return
+    if (live.ended || generation !== live.generation) return
     if (rows.length !== live.count) {
       await schedule($, live, rows.length, live.columns)
       return
@@ -183,14 +247,14 @@ async function tick($: EngineInterface, live: Live, generation: number): Promise
     sample(live, rows)
     const columns = live.columns
     const command = await resolveCommand($, live)
-    if (command === undefined) {
-      if (!live.ended && !live.native && generation === live.generation) {
+    if (command?.own !== true) {
+      if (!live.ended && generation === live.generation) {
         await schedule($, live, rows.length, columns, false)
       }
       return
     }
     const decorations = await run($, live, command, rows, columns)
-    if (!live.ended && !live.native && generation === live.generation) await write($, decorations)
+    await write($, live, decorations, generation)
   } catch (error) {
     // Unexpected host failures retain the last successful result.
     $.ui.log(`subagent-statusline: tick failed: ${String(error)}`, { to: 'debug' })
@@ -198,7 +262,7 @@ async function tick($: EngineInterface, live: Live, generation: number): Promise
     live.busy = false
     // Rows can disappear while the shell runs, without another AgentRow draw.
     try {
-      if (!live.ended && !live.native && (await agents($, live)).length === 0) {
+      if (!live.ended && generation === live.generation && (await agents($, live)).length === 0) {
         await schedule($, live, 0, live.columns)
       }
     } catch (error) {
@@ -229,8 +293,6 @@ async function resolveCommand($: EngineInterface, live: Live): Promise<Command |
     legacy = user.subagentStatusLine
   }
   if (!isRecord(legacy) || legacy.type !== 'command' || typeof legacy.command !== 'string') return
-  // Legacy commands have no plugin owner; do not give them this mod's identity.
-  if (legacy.command.includes('${CLAUDE_PLUGIN_ROOT}') || legacy.command.includes('${CLAUDE_PLUGIN_DATA}')) return
   return { text: legacy.command, own: false }
 }
 
@@ -306,13 +368,20 @@ function parse($: EngineInterface, stdout: string, ids: ReadonlySet<string>): De
   return decorations
 }
 
-async function write($: EngineInterface, decorations: Decorations): Promise<void> {
-  const { value = {} } = await $.state.get(DECORATIONS)
+async function write($: EngineInterface, live: Live, decorations: Decorations, generation: number, force = false): Promise<void> {
+  const { value = {}, version } = await $.state.get(DECORATIONS)
+  if (generation !== live.generation) return
   const keys = Object.keys(value)
-  if (keys.length === Object.keys(decorations).length && keys.every(key =>
+  if (!force && keys.length === Object.keys(decorations).length && keys.every(key =>
     Object.hasOwn(decorations, key) && value[key] === decorations[key],
   )) return
-  await $.state.set(DECORATIONS, decorations)
+  // A reset writes even an already-empty value, advancing the version so a
+  // publication delayed inside the host cannot land after that reset.
+  const result = await $.state.set(DECORATIONS, decorations, { ifVersion: version })
+  // A publish already inside the host may win this CAS. A reset must still
+  // clear it, unless a newer lifecycle generation has taken ownership.
+  if (force && !result.isSet && generation === live.generation)
+    await write($, live, decorations, generation, true)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
