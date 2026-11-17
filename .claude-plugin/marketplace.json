@@ -1,5 +1,5 @@
 {
   "name": "subagent-statusline-cc",
-  "owner": { "name": "local" },
+  "owner": { "name": "bumfo" },
   "plugins": [{ "name": "subagent-statusline", "source": "./" }]
 }

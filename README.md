@@ -47,26 +47,47 @@ the terminal width changing.
 
 ## Install
 
-Load the folder in every session and give the mod the command, in
-`~/.claude/settings.json`:
+At the prompt of a Claude Code terminal session:
 
-```json
-{
-  "env": { "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/subagent-statusline-cc" },
-  "pluginConfigs": {
-    "subagent-statusline": { "options": { "command": "<your subagentStatusLine command>" } }
-  }
-}
+```
+/plugin install subagent-statusline --marketplace bumfo/subagent-statusline-cc
 ```
 
-Start a new session, check that the rows still look right, then delete the
-`subagentStatusLine` key. Delete it last: until the mod has its own `command`,
-that key is where the mod reads the command from.
+Answer `y` to add the marketplace, then pick a scope. From a shell:
 
-The folder is also a marketplace (`claude plugin marketplace add <folder>`,
-then `claude plugin install subagent-statusline@subagent-statusline-cc`). With
-that install, set `command` from the install screen or `/config`, since the
-`pluginConfigs` key for an installed plugin can differ from the one above.
+```
+claude plugin install subagent-statusline --marketplace bumfo/subagent-statusline-cc
+```
+
+From a local clone instead:
+
+```
+claude plugin marketplace add /path/to/subagent-statusline-cc
+claude plugin install subagent-statusline@subagent-statusline-cc
+```
+
+## Moving off `subagentStatusLine`
+
+1. Copy your `subagentStatusLine.command` into the mod's `command` option.
+   `pluginConfigs` is keyed by plugin id, `<plugin>@<marketplace>`:
+
+   ```json
+   "pluginConfigs": {
+     "subagent-statusline@subagent-statusline-cc": {
+       "options": { "command": "<your subagentStatusLine command>" }
+     }
+   }
+   ```
+
+2. Start a new session, run a subagent, and check its row.
+3. Back up `~/.claude/settings.json`, then delete the `subagentStatusLine` key.
+   Delete it last: until the mod has its own `command`, that key is where the
+   mod reads the command from.
+
+To load a working copy without installing it, set
+`"CLAUDE_CODE_PLUGIN_DIRS": "/path/to/subagent-statusline-cc"` in the settings
+`env`. A plugin loaded that way reads its options from
+`pluginConfigs["subagent-statusline"]`, without the `@<marketplace>` part.
 
 ## Tests
 
