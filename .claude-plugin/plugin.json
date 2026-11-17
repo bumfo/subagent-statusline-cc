@@ -2,6 +2,9 @@
   "name": "subagent-statusline",
   "version": "0.1.0",
   "description": "Runs a subagentStatusLine-style command and draws its output as the subagent rows under the prompt",
+  "license": "MIT",
+  "author": { "name": "bumfo" },
+  "repository": "https://github.com/bumfo/subagent-statusline-cc",
   "types": "./types/index.d.ts",
   "userConfig": {
     "command": {
