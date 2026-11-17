@@ -143,7 +143,7 @@ async function schedule(
   enabled = live.enabled,
   drawing = false,
 ): Promise<void> {
-  // Native effects depend on producer count and width, not identities/status.
+  // Refresh inputs are producer count and width, not identities/status.
   if (live.count === count && live.columns === columns && live.enabled === enabled) return
   cancel(live)
   live.count = count
@@ -272,8 +272,8 @@ async function run(
       cwd: info.configRoot ?? cwd, env, stdin: JSON.stringify(input), timeoutMs: TIMEOUT_MS,
     })
   } catch (error) {
-    // Public process.run throws for spawn failures/timeouts; native exec returns
-    // a nonzero result for these. Both must restore the host's default columns.
+    // process.run throws for spawn failures/timeouts. Like nonzero exits, these
+    // failures must restore the host's default columns.
     $.ui.log(`subagent-statusline: command did not run: ${String(error)}`, { to: 'debug' })
     return {}
   }

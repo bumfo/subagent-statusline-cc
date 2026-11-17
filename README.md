@@ -8,10 +8,6 @@ The compatibility target is the native **2.1.322** command protocol and refresh
 lifecycle. The implementation uses public Mods APIs, with no runtime packages
 and no separate row renderer.
 
-Source audit: native `n4e` (command input/execution), `oSe` (refresh lifecycle)
-and `o4e` (token samples). The tests encode their contracts independently;
-the reference source is not required to run them.
-
 The mod hooks `ui.render` on `AgentRow`. On a timer it runs the command once for
 all agent rows, passing the same JSON on stdin that Claude Code passed. The
 command prints one `{"id": ..., "content": ...}` JSON line per row, and each
@@ -188,22 +184,22 @@ cover the reviewed disabling/native-takeover paths, repeated draws, multiple
 widths, hidden-row composition, all four surfaces, command input/provenance,
 policy precedence, sampling, retained completed rows, failures and cancellation.
 
-Both suites test source-derived contracts and UI delegation, not terminal
+Both suites test command contracts and UI delegation, not terminal
 pixels. Neither copies the renderer. ANSI integration coverage passes the body
 to the kit's own `AgentRow`, not a custom `Text` node that forbids escape codes.
 
-### Native-322 decisions retained after review
+### Compatibility details
 
-These less-obvious behaviors were checked in native source, not inferred from
-the previous branch or from rendered output:
+The compatibility contract includes these less-obvious behaviors, covered by
+the integration suite:
 
-| Behavior | Native evidence / integration coverage |
+| Behavior | Expected result |
 | --- | --- |
-| A pending command can delay a new agent's refresh until the next 5-second tick | `oSe` shares a busy ref across effect generations; its 300 ms callback skips while busy. The stale result is discarded. |
-| Retained completed rows continue refreshing | `tSe` keeps eligible retained/unevicted terminal tasks; `oSe` stops on an empty producer list, not merely when nothing runs. |
-| An empty legacy command is present | `eSe` returns `command` without trimming and `oSe` checks `!== undefined`. An unset command is different. |
-| `disableAllHooks` is policy-only for this native status-line path | `n4e` calls `oh`, which reads managed policy. Project commands remain excluded. |
-| Samples belong to refreshes | `oSe`/`o4e` keep the latest 16 refresh samples. The newer public `AgentInfo.tokenSamples` has a different sampling lifetime; substituting it would change stdin. |
+| A pending command can delay a new agent's refresh until the next 5-second tick | The 300 ms callback skips while a command is busy. An obsolete result is discarded. |
+| Retained completed rows continue refreshing | Refreshes stop when no eligible rows remain, not merely when nothing is running. |
+| An empty legacy command is present | An empty string runs as a command; an unset command does not. |
+| `disableAllHooks` is policy-only for this status-line path | Managed policy controls the gate. Project commands remain excluded. |
+| Samples belong to refreshes | Each task receives its latest 16 refresh samples, rather than the public `AgentInfo.tokenSamples` history, which has a different sampling lifetime. |
 
 The public API supplies normalized agent fields rather than every private task
 field. Its required `tokenCount`/`cwd` values are used with harmless native
