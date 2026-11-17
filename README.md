@@ -69,7 +69,8 @@ claude plugin install subagent-statusline@subagent-statusline-cc
 ## Moving off `subagentStatusLine`
 
 1. Copy your `subagentStatusLine.command` into the mod's `command` option.
-   `pluginConfigs` is keyed by plugin id, `<plugin>@<marketplace>`:
+   `pluginConfigs` is keyed by plugin ID, `<plugin>@<marketplace>`. Installed
+   from this repository, the ID is `subagent-statusline@subagent-statusline-cc`:
 
    ```json
    "pluginConfigs": {
@@ -78,6 +79,13 @@ claude plugin install subagent-statusline@subagent-statusline-cc
      }
    }
    ```
+
+   > **Installed from another marketplace?** Your plugin ID is
+   > `subagent-statusline@<that marketplace>`: use the ID listed for the mod
+   > under `enabledPlugins` in `~/.claude/settings.json`, or set `command` in
+   > `/config`, which stores it under your ID. Under any other key the mod
+   > finds no command, and once `subagentStatusLine` is deleted it stops
+   > drawing your rows.
 
 2. Start a new session, run a subagent, and check its row.
 3. Back up `~/.claude/settings.json`, then delete the `subagentStatusLine` key.
