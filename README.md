@@ -45,6 +45,12 @@ the terminal width changing.
 }
 ```
 
+## Requirements
+
+Claude Code 2.1.326 or later. `plugin.json` declares this as
+`"engines": { "claude-code": ">=2.1.326" }`. Builds 2.1.323 to 2.1.325 read
+that field and don't load the mod. Builds before 2.1.323 ignore the field.
+
 ## Install
 
 At the prompt of a Claude Code terminal session:

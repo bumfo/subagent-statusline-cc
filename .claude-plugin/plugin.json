@@ -6,6 +6,7 @@
   "author": { "name": "bumfo" },
   "repository": "https://github.com/bumfo/subagent-statusline-cc",
   "types": "./types/index.d.ts",
+  "engines": { "claude-code": ">=2.1.326" },
   "userConfig": {
     "command": {
       "type": "string",
