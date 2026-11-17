@@ -20,9 +20,12 @@ type Live = {
   enabled: boolean
   ended: boolean
   native: boolean
+  clear?: Timer
   initial?: Timer
   periodic?: Timer
   listing?: Promise<AgentInfo[]>
+  owned: Set<string>
+  widths: Map<string, { columns: number; terminal: boolean }>
   samples: Map<string, number[]>
 }
 
@@ -39,6 +42,8 @@ export const register: Register = (on, options) => {
     enabled: false,
     ended: false,
     native: false,
+    owned: new Set(),
+    widths: new Map(),
     samples: new Map(),
   }
 
@@ -49,6 +54,8 @@ export const register: Register = (on, options) => {
     live.count = 0
     live.enabled = false
     live.samples.clear()
+    live.owned.clear()
+    live.widths.clear()
     await write($, {})
     return next(e)
   })
@@ -62,23 +69,39 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'AgentRow' }, async ($, e, next) => {
-    if (e.surface !== 'terminal' || live.ended) return next(e)
-    // Native empty content hides the row, so body alone cannot detect ownership.
-    if (live.ownCommand.trim() === '' && (e.props.body !== undefined || e.props.isHidden)) {
-      live.native = true
-      cancel(live)
-      await write($, {})
+    if (live.ended) return next(e)
+    // A body/hidden flag may come from another mod, not only native settings.
+    // Delegate this row, never latch ownership for the rest of the session.
+    const owned = live.ownCommand.trim() === '' &&
+      (e.props.body !== undefined || e.props.isHidden)
+    if (owned) live.owned.add(e.props.id)
+    else live.owned.delete(e.props.id)
+    if (e.props.columns !== undefined &&
+      (e.surface === 'terminal' || !live.widths.get(e.props.id)?.terminal)) {
+      live.widths.set(e.props.id, {
+        columns: Math.max(0, e.props.columns), terminal: e.surface === 'terminal',
+      })
     }
-    if (live.native) return next(e)
     try {
       const rows = await agents($, live)
-      const enabled = rows.length > 0 && (await resolveCommand($, live)) !== undefined
-      if (!live.ended && !live.native) {
-        await schedule($, live, rows.length, Math.max(0, e.props.columns ?? 0), enabled)
+      const ids = new Set(rows.map(row => row.id))
+      for (const id of live.owned) if (!ids.has(id)) live.owned.delete(id)
+      for (const id of live.widths.keys()) if (!ids.has(id)) live.widths.delete(id)
+      live.native = rows.length > 0 && rows.every(row => live.owned.has(row.id))
+      const enabled = rows.length > 0 && !live.native &&
+        (await resolveCommand($, live)) !== undefined
+      // Native has one viewport width, not the width of the last row drawn.
+      // Use the first eligible root's measurement, so nested/narrow rows and
+      // other attached surfaces cannot continually reset the shared timers.
+      const leader = rows.find(row => !row.parentId || !ids.has(row.parentId))
+      const columns = leader ? live.widths.get(leader.id)?.columns ?? live.columns : live.columns
+      if (!live.ended) {
+        await schedule($, live, rows.length, columns, enabled, true)
       }
     } catch (error) {
       $.ui.log(`subagent-statusline: row refresh failed: ${String(error)}`, { to: 'debug' })
     }
+    if (owned || live.native || !live.enabled) return next(e)
     const { value } = await $.state.get(DECORATIONS)
     const body = value && Object.hasOwn(value, e.props.id) ? value[e.props.id] : undefined
     // Do not replace the node: the host's row keeps its pointer, ANSI handling,
@@ -93,6 +116,8 @@ function cancel(live: Live): void {
   live.generation++
   live.initial?.cancel()
   live.periodic?.cancel()
+  live.clear?.cancel()
+  live.clear = undefined
   live.initial = undefined
   live.periodic = undefined
 }
@@ -116,6 +141,7 @@ async function schedule(
   count: number,
   columns: number,
   enabled = live.enabled,
+  drawing = false,
 ): Promise<void> {
   // Native effects depend on producer count and width, not identities/status.
   if (live.count === count && live.columns === columns && live.enabled === enabled) return
@@ -125,7 +151,18 @@ async function schedule(
   live.enabled = enabled
   if (count === 0) live.samples.clear()
   if (count === 0 || !enabled) {
-    await write($, {})
+    if (!drawing) {
+      await write($, {})
+      return
+    }
+    // schedule is also reached while drawing. State writes there are denied:
+    // return the native row immediately, then clear from a timer context.
+    live.clear = $.clock.after(0, () => {
+      live.clear = undefined
+      void write($, {}).catch(error => {
+        $.ui.log(`subagent-statusline: clear failed: ${String(error)}`, { to: 'debug' })
+      })
+    })
     return
   }
   const generation = live.generation

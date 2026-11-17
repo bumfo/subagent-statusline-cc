@@ -32,9 +32,11 @@ and click navigation in every terminal mode.
    `subagentStatusLine` in user settings. Project settings are never read for
    shell commands.
 
-While Claude Code still runs `subagentStatusLine` itself and the mod has no
-`command` option, the mod leaves the rows to Claude Code and runs nothing. This
-includes rows that the native command has hidden.
+Without a `command` option, a row arriving with a body or hidden flag is left
+alone. If every eligible row is owned that way, the command stops. Ownership
+is reconsidered on each draw, not latched for the session: another mod hiding
+one row cannot permanently turn off the others. An explicit mod command may
+replace an inherited body or show an inherited hidden row.
 
 Commands in the mod's own option receive its `CLAUDE_PLUGIN_ROOT` and
 `CLAUDE_PLUGIN_DATA`. Legacy commands do not acquire this mod's identity;
@@ -55,6 +57,11 @@ Commands have a 5-second timeout and never overlap. Results from an obsolete
 refresh are discarded. Timers stop when no eligible rows or command remain,
 and when the session ends. A custom `refreshMs` is a mod extension; use the
 default for native timing.
+
+The draw hook never writes UI state. Disabling or delegating a row immediately
+returns the host's row and schedules any clearing through a zero-delay clock
+callback. One root row supplies the shared body width; narrower nested rows
+and remote-surface redraws do not repeatedly reset the command timers.
 
 ## stdin
 
@@ -153,17 +160,52 @@ To load a working copy without installing it, set
 
 ## Tests
 
+Binary-free unit tests need Bun 1.3 or newer (a development tool only):
+
 ```
-bun test
+bun run test
 ```
 
-No install step, generated SDK, Claude binary, API tokens or network access is
-needed. A small mock host supplies all commands, settings, session metadata and
-fake timers. Tests cover exact stdin, command options/environment, JSONL and
-ANSI preservation, hidden-row restoration, refresh and cancellation races,
-policy precedence, and delegation to the same host `AgentRow` in default,
-fullscreen and focus modes. Each run has an isolated temporary config directory.
+This script runs only `checks/register.unit.ts`. It never invokes Claude, a
+shell command, or the network. No install step or generated SDK is needed.
+The small mock host rejects state writes during drawing; it supplies commands,
+settings, session metadata and fake timers. Each run has a temporary config
+directory. Unit files deliberately do not use `.test.ts` names, so the host's
+integration runner does not load Bun imports.
 
-These are source-derived contract and UI-delegation tests, not binary-to-binary
-or terminal-cell comparisons. They deliberately do not copy Claude Code's
-renderer or invoke real shell commands.
+Separately, with Claude Code 2.1.326 or newer already installed, run the official
+host integration suite yourself:
+
+```
+claude plugin test .
+```
+
+It is not part of `bun run test`. Files under `tests/` import only the public
+`claude-code/testing` kit and local helpers. They never invoke a Claude binary
+themselves. Engine-data hooks supply commands/settings while the actual kit
+enforces render-time restrictions, state updates and timer callbacks. Cases
+cover the reviewed disabling/native-takeover paths, repeated draws, multiple
+widths, hidden-row composition, all four surfaces, command input/provenance,
+policy precedence, sampling, retained completed rows, failures and cancellation.
+
+Both suites test source-derived contracts and UI delegation, not terminal
+pixels. Neither copies the renderer. ANSI integration coverage passes the body
+to the kit's own `AgentRow`, not a custom `Text` node that forbids escape codes.
+
+### Native-322 decisions retained after review
+
+These less-obvious behaviors were checked in native source, not inferred from
+the previous branch or from rendered output:
+
+| Behavior | Native evidence / integration coverage |
+| --- | --- |
+| A pending command can delay a new agent's refresh until the next 5-second tick | `oSe` shares a busy ref across effect generations; its 300 ms callback skips while busy. The stale result is discarded. |
+| Retained completed rows continue refreshing | `tSe` keeps eligible retained/unevicted terminal tasks; `oSe` stops on an empty producer list, not merely when nothing runs. |
+| An empty legacy command is present | `eSe` returns `command` without trimming and `oSe` checks `!== undefined`. An unset command is different. |
+| `disableAllHooks` is policy-only for this native status-line path | `n4e` calls `oh`, which reads managed policy. Project commands remain excluded. |
+| Samples belong to refreshes | `oSe`/`o4e` keep the latest 16 refresh samples. The newer public `AgentInfo.tokenSamples` has a different sampling lifetime; substituting it would change stdin. |
+
+The public API supplies normalized agent fields rather than every private task
+field. Its required `tokenCount`/`cwd` values are used with harmless native
+fallbacks for incomplete hosts; extra JSONL ids are rejected. A robust own-property
+write preserves data even for a special-looking id without altering a prototype.

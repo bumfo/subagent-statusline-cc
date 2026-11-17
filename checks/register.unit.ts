@@ -193,6 +193,8 @@ describe('native refresh lifecycle', () => {
     await h.clock.advance(300)
     h.user = {}
     await h.draw()
+    expect(h.forwarded.at(-1)!.props).not.toHaveProperty('body')
+    await h.clock.advance(0)
     expect(h.clock.timers.size).toBe(0)
     expect(h.decorations).toEqual({})
     h.user = { subagentStatusLine: { type: 'command', command: 'new' } }
@@ -423,12 +425,53 @@ describe('AgentRow output delegation', () => {
     expect(h.writes).toBe(1)
   })
 
-  test('nonterminal surface passes through without scheduling commands', async () => {
+  test('nonterminal surfaces use the same command and host row', async () => {
     const h = host()
-    const event = { ...row(), surface: 'web' }
+    const event = { ...row(), surface: 'desktop' }
     await h.draw(event)
-    await h.clock.advance(10000)
-    expect(h.calls).toHaveLength(0)
-    expect(h.forwarded.at(-1)).toBe(event)
+    await h.clock.advance(300)
+    await h.draw(event)
+    expect(h.calls).toHaveLength(1)
+    expect(h.forwarded.at(-1)!.props.body).toBe('decorated')
+    expect(h.writes).toBe(1)
+  })
+
+  test('native takeover after publication clears outside drawing and recovers', async () => {
+    const h = host()
+    await h.start()
+    await h.clock.advance(300)
+    await h.draw(row('a', { body: 'native' }))
+    await h.clock.advance(0)
+    expect(h.decorations).toEqual({})
+    await h.draw(row('a', { body: 'native' }))
+    expect(h.logs).toEqual([])
+    await h.draw(row())
+    await h.clock.advance(300)
+    expect(h.decorations).toEqual({ a: 'decorated' })
+  })
+
+  test('mixed widths do not restart the shared clock on every draw', async () => {
+    const h = host()
+    h.agents.push(agent('b', { parentId: 'a' }))
+    await h.start()
+    for (let i = 0; i < 100; i++) {
+      await h.draw(row('a', { columns: 90 }))
+      await h.draw(row('b', { columns: 50 }))
+      await h.clock.advance(100)
+    }
+    expect(h.calls.map(call => call.at)).toEqual([300, 5000, 10000])
+    expect(h.calls.map(call => JSON.parse(call.init.stdin).columns)).toEqual([90, 90, 90])
+  })
+
+  test('one other-mod hidden row cannot latch off the whole session', async () => {
+    const h = host()
+    h.agents.push(agent('b'))
+    await h.start()
+    await h.draw(row('b', { isHidden: true }))
+    await h.clock.advance(300)
+    expect(h.calls).toHaveLength(1)
+    await h.draw(row('b', { isHidden: false }))
+    await h.clock.advance(4700)
+    expect(h.calls).toHaveLength(2)
   })
 })

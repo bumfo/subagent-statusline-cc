@@ -85,7 +85,7 @@ export function host(options: Record<string, unknown> = {}) {
       CLAUDE_PROJECT_DIR: '/project', CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'session-1',
       CLAUDE_PLUGIN_ROOT: '/plugin', CLAUDE_PLUGIN_DATA: '/plugin-data',
     },
-    decorations: {} as Decorations, writes: 0, listReads: 0,
+    decorations: {} as Decorations, writes: 0, listReads: 0, drawing: 0,
     logs: [] as string[], listError: undefined as Error | undefined,
     settingsError: undefined as Error | undefined,
     hookError: undefined as Error | undefined,
@@ -98,10 +98,13 @@ export function host(options: Record<string, unknown> = {}) {
       return callbacks.get(name)?.(h.api, event, e => e)
     },
     async draw(event = row()) {
-      return callbacks.get('ui.render')!(h.api, event, e => {
-        h.forwarded.push(e)
-        return h.coreNode
-      })
+      h.drawing++
+      try {
+        return await callbacks.get('ui.render')!(h.api, event, e => {
+          h.forwarded.push(e)
+          return h.coreNode
+        })
+      } finally { h.drawing-- }
     },
     async start() { await h.event('session.start'); await h.draw() },
     input(index = h.calls.length - 1) { return JSON.parse(h.calls[index]!.init.stdin) },
@@ -134,7 +137,10 @@ export function host(options: Record<string, unknown> = {}) {
     },
     state: {
       get: async () => ({ value: h.decorations }),
-      set: async (_: unknown, value: Decorations) => { h.writes++; h.decorations = value },
+      set: async (_: unknown, value: Decorations) => {
+        if (h.drawing) throw new Error('state.set: denied while drawing')
+        h.writes++; h.decorations = value
+      },
     },
     ui: { log: (message: string) => { h.logs.push(message) } },
   } as unknown as EngineInterface

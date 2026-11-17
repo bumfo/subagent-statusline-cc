@@ -1,5 +1,6 @@
 {
   "name": "subagent-statusline",
   "private": true,
-  "scripts": { "test": "bun test" }
+  "scripts": { "test": "bun test ./checks/register.unit.ts" },
+  "engines": { "bun": ">=1.3.0" }
 }
