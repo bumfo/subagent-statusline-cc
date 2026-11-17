@@ -1,0 +1,5 @@
+{
+  "name": "subagent-statusline",
+  "private": true,
+  "scripts": { "test": "bun test" }
+}

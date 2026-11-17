@@ -4,52 +4,100 @@ A Claude Code mod that brings back `subagentStatusLine`, the setting that
 replaced each subagent row under the prompt with the output of a shell command.
 Claude Code 2.1.326 marks that setting deprecated in favor of mods.
 
+The compatibility target is the native **2.1.322** command protocol and refresh
+lifecycle. The implementation uses public Mods APIs, with no runtime packages
+and no separate row renderer.
+
+Source audit: native `n4e` (command input/execution), `oSe` (refresh lifecycle)
+and `o4e` (token samples). The tests encode their contracts independently;
+the reference source is not required to run them.
+
 The mod hooks `ui.render` on `AgentRow`. On a timer it runs the command once for
 all agent rows, passing the same JSON on stdin that Claude Code passed. The
 command prints one `{"id": ..., "content": ...}` JSON line per row, and each
-`content` becomes that row's body. Rows the command leaves out, and every row
-after a non-zero exit, keep Claude Code's own columns.
+`content` becomes that row's body. An empty string hides the entire row; leaving
+out a row restores its normal columns. Non-zero exits, spawn errors and timeouts
+also restore the normal columns. ANSI sequences and whitespace are preserved.
+Claude Code's existing `AgentRow` handles colors, truncation, selection, hover
+and click navigation in every terminal mode.
 
 ## Where the command comes from
 
-1. The mod's `command` option (`pluginConfigs` in `~/.claude/settings.json`,
+1. A managed-policy `subagentStatusLine` command, if configured. Policy
+   `disableAllHooks` blocks execution; `allowManagedHooksOnly` prevents fallback
+   to a user command.
+2. The mod's `command` option (`pluginConfigs` in `~/.claude/settings.json`,
    or `/config`).
-2. Otherwise `subagentStatusLine.command` in `~/.claude/settings.json`. Only the
-   user settings file is read; project settings are ignored.
+3. Otherwise a `{ "type": "command", "command": "…" }` value under
+   `subagentStatusLine` in user settings. Project settings are never read for
+   shell commands.
 
 While Claude Code still runs `subagentStatusLine` itself and the mod has no
-`command` option, the mod leaves the rows to Claude Code and runs nothing.
+`command` option, the mod leaves the rows to Claude Code and runs nothing. This
+includes rows that the native command has hidden.
+
+Commands in the mod's own option receive its `CLAUDE_PLUGIN_ROOT` and
+`CLAUDE_PLUGIN_DATA`. Legacy commands do not acquire this mod's identity;
+commands referencing `${CLAUDE_PLUGIN_ROOT}` or `${CLAUDE_PLUGIN_DATA}` there
+are refused. The host remains responsible for workspace trust and plugin
+execution permissions.
 
 ## Options
 
 | Option      | Default | Meaning                                                        |
 | ----------- | ------- | -------------------------------------------------------------- |
 | `command`   | `""`    | Shell command, run with `/bin/sh -c`. Empty: use the legacy key. |
-| `refreshMs` | `5000`  | How often the command reruns while an agent is running.          |
+| `refreshMs` | `5000`  | Periodic refresh while eligible rows exist, including completed rows. Minimum 1000 ms. |
 
-The command also reruns within a second of a row appearing or disappearing, or
-the terminal width changing.
+The first run is debounced by 300 ms. A producer-count or body-width change
+restarts that debounce and the periodic timer; a status change alone does not.
+Commands have a 5-second timeout and never overlap. Results from an obsolete
+refresh are discarded. Timers stop when no eligible rows or command remain,
+and when the session ends. A custom `refreshMs` is a mod extension; use the
+default for native timing.
 
 ## stdin
 
 ```json
 {
   "session_id": "…", "transcript_path": "…", "cwd": "…",
+  "scratchpad_dir": "…", "prompt_id": "…", "agent_type": "…",
   "columns": 96,
   "tasks": [{
     "id": "…", "name": "…", "type": "local_agent", "agentType": "Explore",
     "status": "running", "description": "…", "label": "…", "startTime": 0,
     "model": "…", "effort": "high", "contextWindowSize": 200000,
-    "tokenCount": 0, "tokenSamples": [], "cwd": "…"
+    "tokenCount": 0, "tokenSamples": [0], "cwd": "…"
   }]
 }
 ```
+
+Optional fields are omitted when unavailable. `contextWindowSize` is included
+only when the agent has a model. `tokenSamples` contains the latest 16 token
+counts sampled at actual refreshes, not the host's read-time sampling history.
+`columns` is the available row-body width, already excluding the host's prefix
+and padding. A task without a cwd uses the session cwd. The command itself runs
+in the host's config root when present, otherwise the session cwd.
 
 ## Requirements
 
 Claude Code 2.1.326 or later. `plugin.json` declares this as
 `"engines": { "claude-code": ">=2.1.326" }`. Builds 2.1.323 to 2.1.325 read
 that field and don't load the mod. Builds before 2.1.323 ignore the field.
+
+## Compatibility boundaries
+
+This mod requires a host exposing `AgentRow` (`columns`, `body`, `isHidden`),
+`agent.list`, `session.info`, `process.hookEnv` and the Mods clock APIs. It uses
+the host's public agent projection and `hasRow` eligibility, rather than
+reconstructing private task state. Only local subagent rows participate, not
+main-session workers or teammate rows. Command-hidden rows remain eligible so
+later output can restore them. The last row disappearing is noticed at the next
+refresh or when an in-flight command settles if no further row is rendered.
+
+Commands currently use `/bin/sh -c` on macOS/Linux. Native Windows shell
+selection and private task/model fields are not reimplemented. Host command
+output limits and plugin execution policies still apply.
 
 ## Install
 
@@ -106,6 +154,16 @@ To load a working copy without installing it, set
 ## Tests
 
 ```
-claude plugin validate .
-claude plugin test .
+bun test
 ```
+
+No install step, generated SDK, Claude binary, API tokens or network access is
+needed. A small mock host supplies all commands, settings, session metadata and
+fake timers. Tests cover exact stdin, command options/environment, JSONL and
+ANSI preservation, hidden-row restoration, refresh and cancellation races,
+policy precedence, and delegation to the same host `AgentRow` in default,
+fullscreen and focus modes. Each run has an isolated temporary config directory.
+
+These are source-derived contract and UI-delegation tests, not binary-to-binary
+or terminal-cell comparisons. They deliberately do not copy Claude Code's
+renderer or invoke real shell commands.

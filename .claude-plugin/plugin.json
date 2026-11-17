@@ -1,6 +1,6 @@
 {
   "name": "subagent-statusline",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Runs a subagentStatusLine-style command and draws its output as the subagent rows under the prompt",
   "license": "MIT",
   "author": { "name": "bumfo" },
@@ -17,7 +17,7 @@
     "refreshMs": {
       "type": "number",
       "title": "Refresh interval (ms)",
-      "description": "How often the command runs while an agent is running. The engine's own was 5000.",
+      "description": "How often the command runs while eligible agent rows exist, including retained completed rows. Native default: 5000 ms; minimum: 1000 ms.",
       "default": 5000
     }
   }
