@@ -2,13 +2,17 @@ import type { AgentInfo, EngineInterface, Register, RenderSurface } from 'claude
 
 import type { Decorations } from '../types'
 
-// Claude Code 2.1.322's command protocol and refresh lifecycle, adapted to
-// public Mods APIs. AgentRow still owns rendering, selection and navigation.
+// Stock Claude Code 2.1.326's command protocol, adapted to public Mods APIs.
+// AgentRow still owns rendering, selection and navigation.
 const DECORATIONS = { plugin: 'subagent-statusline', key: 'decorations' } as const
 const INITIAL_MS = 300
-const REFRESH_MS = 5000
+// The mod's own command runs every second, the rate at which stock rows update
+// elapsed time. Claude Code runs a legacy subagentStatusLine itself.
+const REFRESH_MS = 1000
 const TIMEOUT_MS = 5000
 const RESET_ATTEMPTS = 3
+// Polls for a new session id after /clear or resume: about 10 seconds.
+const SUSPENDED_POLLS = 33
 type Timer = { cancel: () => void }
 type Command = { text: string; own: boolean }
 type Live = {
@@ -21,6 +25,7 @@ type Live = {
   enabled: boolean
   ended: boolean
   suspendedId?: string
+  suspendedPolls: number
   clear?: Timer
   wake?: Timer
   initial?: Timer
@@ -38,6 +43,7 @@ export const register: Register = (on, options) => {
     count: 0,
     generation: 0,
     scope: 0,
+    suspendedPolls: 0,
     busy: false,
     enabled: false,
     ended: false,
@@ -58,6 +64,7 @@ export const register: Register = (on, options) => {
     reset(live)
     live.ended = e.reason !== 'clear' && e.reason !== 'resume'
     live.suspendedId = live.ended ? undefined : e.sessionId
+    live.suspendedPolls = 0
     await write($, live, {}, live.generation, true)
     const result = await next(e)
     if (!live.ended) requestRefresh($, live)
@@ -72,6 +79,12 @@ export const register: Register = (on, options) => {
     return result
   }).catch((_, e, next) => next(e))
   on('turn.start', ($, e, next) => {
+    // A turn after /clear or resume means a session is live again, even when
+    // its id did not change (a resume of the same session).
+    if (live.suspendedId !== undefined) {
+      reset(live)
+      live.suspendedId = undefined
+    }
     requestRefresh($, live)
     return next(e)
   })
@@ -152,7 +165,9 @@ async function refresh($: EngineInterface, live: Live, drawing = false): Promise
   // and settings reads that every row draw would otherwise make.
   if (live.ownCommand.trim() === '') return
   if (!await enterSession($, live)) {
-    if (!live.ended) requestRefresh($, live, INITIAL_MS)
+    // Watch for the new session id for a while; after that, the next turn or
+    // row draw ends the suspension.
+    if (!live.ended && live.suspendedPolls++ < SUSPENDED_POLLS) requestRefresh($, live, INITIAL_MS)
     return
   }
   const generation = live.generation

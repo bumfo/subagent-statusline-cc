@@ -1,6 +1,6 @@
 {
   "name": "subagent-statusline",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Runs a subagentStatusLine-style command and draws its output as the subagent rows under the prompt",
   "license": "MIT",
   "author": { "name": "bumfo" },
@@ -11,7 +11,7 @@
     "command": {
       "type": "string",
       "title": "Command",
-      "description": "Shell command run with native-322 subagentStatusLine JSON on stdin; prints one {\"id\",\"content\"} JSON line per row. Managed hook policy takes precedence. Empty: leave legacy subagentStatusLine execution to Claude Code.",
+      "description": "Receives subagentStatusLine JSON on stdin and prints one {\"id\",\"content\"} JSON line per row. Required: the mod does nothing while this is empty.",
       "default": ""
     }
   }

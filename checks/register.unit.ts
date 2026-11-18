@@ -103,7 +103,7 @@ describe('command input and execution', () => {
 })
 
 describe('native refresh lifecycle', () => {
-  test('initial 300 ms debounce and anchored 5 s interval; shared across row draws', async () => {
+  test('initial 300 ms debounce and anchored one-second interval; shared across row draws', async () => {
     const h = host()
     h.agents.push(agent('b'))
     await h.event('session.start')
@@ -114,12 +114,12 @@ describe('native refresh lifecycle', () => {
     expect(h.calls).toHaveLength(0)
     await h.clock.advance(1)
     expect(h.calls.map(call => call.at)).toEqual([300])
-    await h.clock.advance(4699)
+    await h.clock.advance(699)
     expect(h.calls).toHaveLength(1)
     await h.clock.advance(1)
-    expect(h.calls.map(call => call.at)).toEqual([300, 5000])
-    await h.clock.advance(5000)
-    expect(h.calls.map(call => call.at)).toEqual([300, 5000, 10000])
+    expect(h.calls.map(call => call.at)).toEqual([300, 1000])
+    await h.clock.advance(1000)
+    expect(h.calls.map(call => call.at)).toEqual([300, 1000, 2000])
   })
 
   test('completion and same-count identity changes do not reset timer; retained rows still refresh', async () => {
@@ -130,8 +130,8 @@ describe('native refresh lifecycle', () => {
     await h.draw(row('b'))
     await h.clock.advance(300)
     expect(h.calls).toHaveLength(1)
-    await h.clock.advance(9400)
-    expect(h.calls.map(call => call.at)).toEqual([300, 5000, 10000])
+    await h.clock.advance(1400)
+    expect(h.calls.map(call => call.at)).toEqual([300, 1000, 2000])
     expect(h.input().tasks[0].tokenSamples).toEqual([1234, 1234])
     expect(h.input().tasks[0].status).toBe('completed')
   })
@@ -149,8 +149,8 @@ describe('native refresh lifecycle', () => {
     await h.clock.advance(1)
     expect(h.calls[0]!.at).toBe(700)
     expect(h.input().columns).toBe(0)
-    await h.clock.advance(4700)
-    expect(h.calls.map(call => call.at)).toEqual([700, 5400])
+    await h.clock.advance(700)
+    expect(h.calls.map(call => call.at)).toEqual([700, 1400])
   })
 
   test('collects at most 16 samples on actual runs, not host reads', async () => {
@@ -160,7 +160,7 @@ describe('native refresh lifecycle', () => {
     for (let i = 1; i <= 18; i++) {
       h.agents[0]!.tokenCount = i
       await h.draw()
-      await h.clock.advance(i === 1 ? 4700 : 5000)
+      await h.clock.advance(i === 1 ? 700 : 1000)
     }
     expect(h.input().tasks[0].tokenSamples).toEqual(Array.from({ length: 16 }, (_, i) => i + 3))
   })
@@ -170,7 +170,7 @@ describe('native refresh lifecycle', () => {
     await h.start()
     await h.clock.advance(300)
     h.agents = []
-    await h.clock.advance(4700) // No draw for the last removed row.
+    await h.clock.advance(700) // No draw for the last removed row.
     expect(h.decorations).toEqual({})
     expect(h.clock.timers.size).toBe(0)
     h.agents = [agent()]
@@ -222,10 +222,10 @@ describe('native refresh lifecycle', () => {
     await h.draw()
     await h.clock.advance(300)
     expect(h.calls).toHaveLength(1)
-    await h.clock.advance(4400)
+    await h.clock.advance(400)
     expect(h.calls[1]!.argv[2]).toBe('fixture-command')
     h.policy.disableAllHooks = true
-    await h.clock.advance(5000)
+    await h.clock.advance(1000)
     expect(h.calls).toHaveLength(2)
     expect(h.clock.timers.size).toBe(0)
     expect(h.decorations).toEqual({})
@@ -241,7 +241,7 @@ describe('native refresh lifecycle', () => {
     pending.resolve(output())
     await flush()
     h.answer = () => output()
-    await h.clock.advance(5000)
+    await h.clock.advance(1000)
     expect(h.calls).toHaveLength(2)
     expect(h.input().tasks[0].tokenSamples).toEqual([1234, 1234])
   })
@@ -305,11 +305,11 @@ describe('native refresh lifecycle', () => {
     expect(b.decorations).toEqual({ a: 'second' })
   })
 
-  test.each([1000, 10000])('obsolete saved refresh interval %s does not change the native command timer', async refreshMs => {
+  test.each([5000, 10000])('obsolete saved refresh interval %s does not change the one-second command timer', async refreshMs => {
     const h = host({ refreshMs })
     await h.start()
-    await h.clock.advance(5000)
-    expect(h.calls.map(call => call.at)).toEqual([300, 5000])
+    await h.clock.advance(1000)
+    expect(h.calls.map(call => call.at)).toEqual([300, 1000])
   })
 
   test('the installation form offers the command but no timer setting', async () => {
@@ -354,7 +354,7 @@ describe('AgentRow output delegation', () => {
     await h.draw()
     expect(h.forwarded.at(-1)!.props).toMatchObject({ isHidden: true, body: undefined })
     h.answer = () => output('restored')
-    await h.clock.advance(4700)
+    await h.clock.advance(700)
     await h.draw()
     expect(h.forwarded.at(-1)!.props).toMatchObject({ isHidden: false, body: 'restored' })
   })
@@ -377,7 +377,7 @@ describe('AgentRow output delegation', () => {
       if (failure !== 'nonzero') throw new Error(failure)
       return { exitCode: 7, stderr: 'failure', stdout: output('must not show').stdout }
     }
-    await h.clock.advance(4700)
+    await h.clock.advance(700)
     const event = row()
     await h.draw(event)
     expect(h.decorations).toEqual({})
@@ -389,7 +389,7 @@ describe('AgentRow output delegation', () => {
     await h.start()
     await h.clock.advance(300)
     h.settingsError = new Error('host unavailable')
-    await h.clock.advance(4700)
+    await h.clock.advance(700)
     expect(h.decorations).toEqual({ a: 'decorated' })
     h.listError = new Error('list unavailable')
     await h.draw()
@@ -420,7 +420,7 @@ describe('AgentRow output delegation', () => {
     const h = host()
     await h.start()
     await h.clock.advance(10000)
-    expect(h.calls).toHaveLength(3)
+    expect(h.calls).toHaveLength(11)
     expect(h.writes).toBe(2) // Forced session reset, then one changed output.
   })
 
@@ -460,8 +460,8 @@ describe('AgentRow output delegation', () => {
       await h.draw(row('b', { columns: 50 }))
       await h.clock.advance(100)
     }
-    expect(h.calls.map(call => call.at)).toEqual([300, 5000, 10000])
-    expect(h.calls.map(call => JSON.parse(call.init.stdin).columns)).toEqual([90, 90, 90])
+    expect(h.calls.map(call => call.at)).toEqual([300, ...Array.from({ length: 10 }, (_, n) => (n + 1) * 1000)])
+    expect(h.calls.map(call => JSON.parse(call.init.stdin).columns)).toEqual(Array(11).fill(90))
   })
 
   test('one other-mod hidden row cannot latch off the whole session', async () => {
@@ -472,7 +472,7 @@ describe('AgentRow output delegation', () => {
     await h.clock.advance(300)
     expect(h.calls).toHaveLength(1)
     await h.draw(row('b', { isHidden: false }))
-    await h.clock.advance(4700)
+    await h.clock.advance(700)
     expect(h.calls).toHaveLength(2)
   })
 })
@@ -544,8 +544,8 @@ describe('reviewed lifecycle boundaries', () => {
       await h.draw({ ...row('b', { columns: 55 }), surface: 'vscode' })
       await h.clock.advance(100)
     }
-    expect(h.calls.map(call => call.at)).toEqual([300, 5000, 10000])
-    expect(h.calls.map(call => JSON.parse(call.init.stdin).columns)).toEqual([81, 81, 81])
+    expect(h.calls.map(call => call.at)).toEqual([300, ...Array.from({ length: 10 }, (_, n) => (n + 1) * 1000)])
+    expect(h.calls.map(call => JSON.parse(call.init.stdin).columns)).toEqual(Array(11).fill(81))
     await h.event('session.detach', { surface: 'desktop' })
     await h.clock.advance(300)
     expect(h.input().columns).toBe(55)
@@ -598,11 +598,11 @@ describe('merge-review fixes', () => {
     const drawing = h.draw(row('a', { columns: 40 }))
     await flush()
     h.agents.push(agent('b'))
-    await h.clock.advance(4700) // The periodic tick sees two rows and restarts the timers.
+    await h.clock.advance(700) // The periodic tick sees two rows and restarts the timers.
     gate.resolve()
     await drawing
     await h.clock.advance(300)
-    expect(h.calls.map(call => call.at)).toEqual([300, 5300])
+    expect(h.calls.map(call => call.at)).toEqual([300, 1300])
     expect(h.input().columns).toBe(40)
   })
 
@@ -613,7 +613,7 @@ describe('merge-review fixes', () => {
       await h.draw(row('a', { columns: Number.NaN }))
       await h.clock.advance(100)
     }
-    expect(h.calls.map(call => call.at)).toEqual([300])
+    expect(h.calls.map(call => call.at)).toEqual([300, 1000, 2000])
   })
 
   test('clear keeps the last measured width for the new session', async () => {

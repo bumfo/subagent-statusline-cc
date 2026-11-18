@@ -31,6 +31,7 @@ export function engine(on: On) {
     sessionId: 'session-1',
     core: false,
     policyGate: undefined as Promise<void> | undefined,
+    idReads: 0,
     logs: [] as string[],
     answer: (() => output()) as () => ReturnType<typeof output> | Promise<ReturnType<typeof output>>,
   }
@@ -38,7 +39,7 @@ export function engine(on: On) {
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('turn.start', () => ({ turnId: 'turn-1' }))
   on('agent.list', () => ({ value: fixture.agents }))
-  on('session.id', () => ({ value: fixture.sessionId }))
+  on('session.id', () => { fixture.idReads++; return { value: fixture.sessionId } })
   on('session.cwd', () => ({ value: '/session-cwd' }))
   on('session.info', () => ({ value: {
     transcriptPath: '/transcripts/session-1.jsonl', scratchpadDir: '/scratch',
