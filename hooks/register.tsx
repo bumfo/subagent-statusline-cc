@@ -6,7 +6,8 @@ import type { Decorations } from '../types'
 // public Mods APIs. AgentRow still owns rendering, selection and navigation.
 const DECORATIONS = { plugin: 'subagent-statusline', key: 'decorations' } as const
 const INITIAL_MS = 300
-const REFRESH_MS = 5000
+// Mod-owned commands tick with the visible row clock. The host owns legacy commands.
+const REFRESH_MS = 1000
 const TIMEOUT_MS = 5000
 const RESET_ATTEMPTS = 3
 type Timer = { cancel: () => void }

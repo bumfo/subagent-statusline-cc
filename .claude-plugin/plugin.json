@@ -1,6 +1,6 @@
 {
   "name": "subagent-statusline",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Runs a subagentStatusLine-style command and draws its output as the subagent rows under the prompt",
   "license": "MIT",
   "author": { "name": "bumfo" },

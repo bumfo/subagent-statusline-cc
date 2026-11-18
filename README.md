@@ -56,8 +56,9 @@ Commands have a 5-second timeout and never overlap. Results from an obsolete
 refresh are discarded. Timers stop when no eligible rows or command remain,
 and when the process exits. `/clear` and in-process resume cancel old work and
 restart after the session id changes, without needing another `session.start`.
-No refresh interval needs configuring. A configured command runs on a
-five-second timer while eligible rows exist, including retained completed rows.
+No refresh interval needs configuring. A command set in the mod runs every
+second while eligible rows exist, including retained completed rows. A legacy
+command left in Claude Code's own settings keeps its native five-second interval.
 Without a command the mod starts no timer: Claude Code draws its stock rows
 and updates running agents’ elapsed time every second.
 
@@ -218,7 +219,7 @@ the integration suite:
 
 | Behavior | Expected result |
 | --- | --- |
-| A pending command can delay a new agent's refresh until the next 5-second tick | The 300 ms callback skips while a command is busy. An obsolete result is discarded. |
+| A pending command can delay a new agent's refresh until the next one-second tick | The 300 ms callback skips while a command is busy. An obsolete result is discarded. |
 | Retained completed rows continue refreshing | Refreshes stop when no eligible rows remain, not merely when nothing is running. |
 | A legacy command, even an empty one, belongs to the host | The mod never starts a duplicate runner; use its `command` option for mod-owned execution. |
 | `disableAllHooks` is policy-only for this status-line path | Managed policy controls the gate. Project commands remain excluded. |

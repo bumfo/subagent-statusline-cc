@@ -58,12 +58,12 @@ test('another mod hiding one row never disables all rows or latches ownership', 
   expect(await textOf(a)).toBe('decorated')
   expect(await textOf(b)).toBe('hidden')
   await b.redraw(row('b').props)
-  await h.clock.advance(4700)
+  await h.clock.advance(700)
   expect(h.calls).toHaveLength(2)
   expect(await textOf(a)).toBe('decorated')
 })
 
-test('different row widths cannot turn the shared 5-second interval into a 300-ms loop', async ($, on) => {
+test('different row widths cannot turn the shared one-second interval into a 300-ms loop', async ($, on) => {
   const h = engine(on)
   h.agents.push(agent('b', { parentId: 'a' }))
   const a = await $.ui.mount(row())
@@ -73,8 +73,8 @@ test('different row widths cannot turn the shared 5-second interval into a 300-m
     await b.redraw()
     await h.clock.advance(100)
   }
-  expect(h.calls.map(call => call.at)).toEqual([300, 5000, 10000])
-  expect(h.calls.map(call => JSON.parse(call.init.stdin).columns)).toEqual([90, 90, 90])
+  expect(h.calls.map(call => call.at)).toEqual([300, ...Array.from({ length: 10 }, (_, n) => (n + 1) * 1000)])
+  expect(h.calls.map(call => JSON.parse(call.init.stdin).columns)).toEqual(Array(11).fill(90))
 })
 
 for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
@@ -84,10 +84,10 @@ for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     await h.clock.advance(300)
     expect(await textOf(ui)).toBe('decorated')
     h.answer = () => output('')
-    await h.clock.advance(4700)
+    await h.clock.advance(700)
     expect(await textOf(ui)).toBe('hidden')
     h.answer = () => output('restored')
-    await h.clock.advance(5000)
+    await h.clock.advance(1000)
     expect(await textOf(ui)).toBe('restored')
   })
 }
@@ -126,8 +126,8 @@ test('skips an already-busy debounce, drops stale results and uses the next peri
   pending.resolve(output('stale'))
   await h.clock.settle()
   expect(await textOf(ui)).toBe('engine columns')
-  await h.clock.advance(4700)
-  expect(h.calls.map(call => call.at)).toEqual([300, 5300])
+  await h.clock.advance(700)
+  expect(h.calls.map(call => call.at)).toEqual([300, 1300])
   expect(JSON.parse(h.calls[1]!.init.stdin).tasks).toHaveLength(2)
   expect(await textOf(ui)).toBe('fresh')
 })
@@ -138,8 +138,8 @@ test('retained completed rows keep refreshing; eviction stops the timer', async 
   await h.clock.advance(300)
   h.agents = [agent('a', { status: 'completed', taskStatus: 'completed' })]
   await ui.redraw(row('a', h.agents[0]).props)
-  await h.clock.advance(9700)
-  expect(h.calls.map(call => call.at)).toEqual([300, 5000, 10000])
+  await h.clock.advance(1700)
+  expect(h.calls.map(call => call.at)).toEqual([300, 1000, 2000])
   expect(JSON.parse(h.calls[2]!.init.stdin).tasks[0].status).toBe('completed')
   h.agents = []
   await h.clock.advance(15000)
@@ -213,7 +213,7 @@ test('samples actual refreshes, not unrelated host reads; keeps the latest 16', 
     h.agents[0]!.tokenCount = i
     h.agents[0]!.tokenSamples = [99999]
     await ui.redraw()
-    await h.clock.advance(i === 1 ? 4700 : 5000)
+    await h.clock.advance(i === 1 ? 700 : 1000)
   }
   expect(JSON.parse(h.calls[18]!.init.stdin).tasks[0].tokenSamples).toEqual(
     Array.from({ length: 16 }, (_, i) => i + 3),
@@ -229,7 +229,7 @@ for (const failure of ['exit', 'spawn', 'timeout']) {
       if (failure !== 'exit') throw new Error(failure)
       return { ...output('incorrect'), exitCode: 2 }
     }
-    await h.clock.advance(4700)
+    await h.clock.advance(700)
     expect(await textOf(ui)).toBe('engine columns')
   })
 }
@@ -346,7 +346,7 @@ test('session start and a later turn discover rows without any UI mount', async 
   await h.clock.advance(300)
   expect(h.calls).toHaveLength(1)
   h.agents = []
-  await h.clock.advance(4700)
+  await h.clock.advance(700)
   h.agents = [agent('b')]
   await $.turn.start({ text: '', turnId: 'turn-2', agentId: 'b' })
   await h.clock.advance(300)
@@ -364,8 +364,8 @@ test('desktop/vscode redraws use one stable measured root even when the first ro
     await vscode.redraw()
     await h.clock.advance(100)
   }
-  expect(h.calls.map(call => call.at)).toEqual([300, 5000, 10000])
-  expect(h.calls.map(call => JSON.parse(call.init.stdin).columns)).toEqual([81, 81, 81])
+  expect(h.calls.map(call => call.at)).toEqual([300, ...Array.from({ length: 10 }, (_, n) => (n + 1) * 1000)])
+  expect(h.calls.map(call => JSON.parse(call.init.stdin).columns)).toEqual(Array(11).fill(81))
 })
 
 for (const boundary of ['read', 'set'] as const) {
@@ -420,7 +420,7 @@ test('a clear while a tick reads settings does not start the old command', async
   expect(h.calls).toHaveLength(1)
   const pending = deferred<void>()
   h.policyGate = pending.promise
-  await h.clock.advance(4700) // The periodic tick waits in its policy read.
+  await h.clock.advance(700) // The periodic tick waits in its policy read.
   await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
   h.sessionId = 'session-2'
   pending.resolve()
