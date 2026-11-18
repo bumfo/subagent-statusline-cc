@@ -4,9 +4,11 @@ A Claude Code mod that brings back `subagentStatusLine`, the setting that
 replaced each subagent row under the prompt with the output of a shell command.
 Claude Code 2.1.326 marks that setting deprecated in favor of mods.
 
-The compatibility target is the native **2.1.322** command protocol and refresh
-lifecycle. The implementation uses public Mods APIs, with no runtime packages
-and no separate row renderer.
+The reference is **stock Claude Code 2.1.326 in the same configuration**:
+with a command, match its command input, execution and rendered output; without
+a command, leave the stock row and its clock to Claude Code. If 2.1.322 differs,
+2.1.326 takes precedence. The implementation uses public Mods APIs, with no
+runtime packages and no separate row renderer.
 
 The mod hooks `ui.render` on `AgentRow`. On a timer it runs the command once for
 all agent rows, passing the same JSON on stdin that Claude Code passed. The

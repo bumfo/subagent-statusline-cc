@@ -2,7 +2,7 @@ import type { AgentInfo, EngineInterface, Register, RenderSurface } from 'claude
 
 import type { Decorations } from '../types'
 
-// Claude Code 2.1.322's command protocol and refresh lifecycle, adapted to
+// Stock Claude Code 2.1.326's command protocol and refresh lifecycle, adapted to
 // public Mods APIs. AgentRow still owns rendering, selection and navigation.
 const DECORATIONS = { plugin: 'subagent-statusline', key: 'decorations' } as const
 const INITIAL_MS = 300

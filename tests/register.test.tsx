@@ -92,7 +92,7 @@ for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
   })
 }
 
-test('native 322 input preserves all fields, command environment and body width', async ($, on) => {
+test('input preserves all fields, command environment and body width', async ($, on) => {
   const h = engine(on)
   await $.ui.mount(row())
   await h.clock.advance(300)
@@ -112,7 +112,7 @@ test('native 322 input preserves all fields, command environment and body width'
   })
 })
 
-test('native 322 skips an already-busy debounce, drops stale results and uses the next periodic refresh', async ($, on) => {
+test('skips an already-busy debounce, drops stale results and uses the next periodic refresh', async ($, on) => {
   const h = engine(on)
   const pending = deferred<ReturnType<typeof output>>()
   h.answer = () => pending.promise
@@ -132,7 +132,7 @@ test('native 322 skips an already-busy debounce, drops stale results and uses th
   expect(await textOf(ui)).toBe('fresh')
 })
 
-test('native 322 retained completed rows keep refreshing; eviction stops the timer', async ($, on) => {
+test('retained completed rows keep refreshing; eviction stops the timer', async ($, on) => {
   const h = engine(on)
   const ui = await $.ui.mount(row())
   await h.clock.advance(300)
@@ -169,7 +169,7 @@ for (const policy of [{ disableAllHooks: true }, { allowManagedHooksOnly: true }
   })
 }
 
-test('native 322 status-line disableAllHooks gate is policy-only, not user settings', async ($, on) => {
+test('status-line disableAllHooks gate is policy-only, not user settings', async ($, on) => {
   const h = engine(on)
   h.user.disableAllHooks = true
   await $.ui.mount(row())
@@ -205,7 +205,7 @@ test('the mod option needs no legacy native setting, including after session sta
   expect(h.calls[0]?.argv[2]).toBe('own')
 })
 
-test('native 322 samples actual refreshes, not unrelated host reads; keeps the latest 16', async ($, on) => {
+test('samples actual refreshes, not unrelated host reads; keeps the latest 16', async ($, on) => {
   const h = engine(on)
   const ui = await $.ui.mount(row())
   await h.clock.advance(300)
