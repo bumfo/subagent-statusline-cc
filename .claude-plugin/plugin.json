@@ -1,6 +1,6 @@
 {
   "name": "subagent-statusline",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Runs a subagentStatusLine-style command and draws its output as the subagent rows under the prompt",
   "license": "MIT",
   "author": { "name": "bumfo" },
@@ -11,14 +11,8 @@
     "command": {
       "type": "string",
       "title": "Command",
-      "description": "Shell command run with the legacy subagentStatusLine JSON on stdin; it prints one {\"id\",\"content\"} JSON line per row. Empty: use subagentStatusLine.command from ~/.claude/settings.json.",
+      "description": "Shell command run with native-322 subagentStatusLine JSON on stdin; prints one {\"id\",\"content\"} JSON line per row. Managed hook policy takes precedence. Empty: leave legacy subagentStatusLine execution to Claude Code.",
       "default": ""
-    },
-    "refreshMs": {
-      "type": "number",
-      "title": "Refresh interval (ms)",
-      "description": "How often the command runs while an agent is running. The engine's own was 5000.",
-      "default": 5000
     }
   }
 }
