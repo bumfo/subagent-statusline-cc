@@ -555,3 +555,80 @@ test('without a command, row draws read no state', { options: { command: '' } },
   expect(reads - before).toBe(0)
   expect(await textOf(ui)).toBe('engine columns')
 })
+
+test('a slow /clear that keeps the old id never restarts the command for the ended session', async ($, on) => {
+  const h = engine(on)
+  await $.ui.mount(row())
+  await h.clock.advance(300)
+  await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+  await h.clock.advance(4600)
+  await $.turn.start({ text: '', turnId: 'turn-2' })
+  await h.clock.advance(600)
+  expect(h.calls).toHaveLength(1)
+  h.sessionId = 'session-2'
+  await $.turn.start({ text: '', turnId: 'turn-3' })
+  await h.clock.advance(600)
+  expect(h.calls).toHaveLength(2)
+  expect(JSON.parse(h.calls[1]!.init.stdin).session_id).toBe('session-2')
+})
+
+test('a delayed repair does not roll a row back to an older run', async ($, on) => {
+  const h = engine(on)
+  const clearStall = deferred<void>()
+  const repairStall = deferred<void>()
+  let clearArmed = false
+  let repairArmed = false
+  on('state.set', { plugin: 'subagent-statusline', key: 'decorations' }, async (_, e, next) => {
+    const value = e.value as Record<string, string>
+    if (clearArmed && Object.keys(value).length === 0) { clearArmed = false; await clearStall.promise }
+    else if (repairArmed && value.a === 'decorated') { repairArmed = false; await repairStall.promise }
+    return next(e)
+  })
+  const ui = await $.ui.mount(row())
+  await h.clock.advance(300)
+  clearArmed = true
+  h.policy.disableAllHooks = true
+  await ui.redraw()
+  await h.clock.settle()
+  h.policy = {}
+  await ui.redraw()
+  await h.clock.advance(300) // Same output as stored: no publication.
+  repairArmed = true
+  clearStall.resolve() // The old clear lands; its repair stalls.
+  await h.clock.settle()
+  h.answer = () => output('fresh')
+  await h.clock.advance(1000)
+  expect(await textOf(ui)).toBe('fresh')
+  repairStall.resolve()
+  await h.clock.settle()
+  expect(await textOf(ui)).toBe('fresh')
+})
+
+test('the unversioned last-resort clear does not erase newer output', async ($, on) => {
+  const h = engine(on)
+  const stall = deferred<void>()
+  let conflicts = 0
+  let armed = false
+  on('state.set', { plugin: 'subagent-statusline', key: 'decorations' }, async (_, e, next) => {
+    if (armed && Object.keys(e.value as object).length === 0) {
+      if (e.ifVersion !== undefined && conflicts < 3) { conflicts++; return { value: { isSet: false, version: 0 } } }
+      if (e.ifVersion === undefined) { armed = false; await stall.promise }
+    }
+    return next(e)
+  })
+  const ui = await $.ui.mount(row())
+  await h.clock.advance(300)
+  armed = true
+  h.policy.disableAllHooks = true
+  await ui.redraw()
+  await h.clock.settle()
+  expect(conflicts).toBe(3)
+  h.policy = {}
+  h.answer = () => output('fresh')
+  await ui.redraw()
+  await h.clock.advance(300)
+  expect(await textOf(ui)).toBe('fresh')
+  stall.resolve()
+  await h.clock.settle()
+  expect(await textOf(ui)).toBe('fresh')
+})

@@ -11,8 +11,9 @@ const INITIAL_MS = 300
 const REFRESH_MS = 1000
 const TIMEOUT_MS = 5000
 const WRITE_ATTEMPTS = 3
-// Polls for a new session id after /clear or resume, about 3 seconds. If the
-// id has not changed by then, the same session was resumed and the mod goes on.
+// Polls for a new session id after /clear or resume, about 3 seconds. After a
+// resume, an unchanged id by then means the same session goes on. After
+// /clear, later row draws and turns keep checking for the new id.
 const SUSPENDED_POLLS = 10
 type Timer = { cancel: () => void }
 type Command = { text: string; own: boolean }
@@ -28,7 +29,9 @@ type Live = {
   suspendedId?: string
   suspendedPolls: number
   clearing: boolean
-  output?: { generation: number; decorations: Decorations }
+  output?: { generation: number; seq: number; decorations: Decorations }
+  outputSeq: number
+  endReason?: string
   clear?: Timer
   wake?: Timer
   initial?: Timer
@@ -48,6 +51,7 @@ export const register: Register = (on, options) => {
     scope: 0,
     suspendedPolls: 0,
     clearing: false,
+    outputSeq: 0,
     busy: false,
     enabled: false,
     ended: false,
@@ -68,6 +72,7 @@ export const register: Register = (on, options) => {
     reset(live)
     live.ended = e.reason !== 'clear' && e.reason !== 'resume'
     live.suspendedId = live.ended ? undefined : e.sessionId
+    live.endReason = e.reason
     live.suspendedPolls = 0
     // Nothing restarts until the engine has finished ending the session.
     live.clearing = true
@@ -88,10 +93,11 @@ export const register: Register = (on, options) => {
     return result
   }).catch((_, e, next) => next(e))
   on('turn.start', ($, e, next) => {
-    // A main-loop turn after /clear or resume means a session is live again,
-    // even when its id did not change (a resume of the same session). A
-    // subagent's turn says nothing about which session is live.
-    if (live.suspendedId !== undefined && !live.clearing && e.agentId === undefined) {
+    // A main-loop turn after a resume means the session is live again, even
+    // when its id did not change. After /clear the mod waits for the new id.
+    // A subagent's turn says nothing about which session is live.
+    if (live.suspendedId !== undefined && !live.clearing && e.agentId === undefined &&
+      live.endReason === 'resume') {
       reset(live)
       live.suspendedId = undefined
     }
@@ -153,8 +159,10 @@ async function enterSession($: EngineInterface, live: Live): Promise<boolean> {
   if (live.ended || live.clearing) return false
   const ending = live.suspendedId
   if (ending === undefined) return true
-  // Same id after the polls ran out: the same session was resumed.
-  if (await $.session.id() === ending && live.suspendedPolls < SUSPENDED_POLLS) return false
+  // After /clear, wait for the new session id. After a resume, an id that is
+  // unchanged once the polls run out means the same session was resumed.
+  if (await $.session.id() === ending &&
+    (live.endReason !== 'resume' || live.suspendedPolls < SUSPENDED_POLLS)) return false
   // /clear and in-process resume do not emit session.start. Their next session
   // has new timer/sample/measurement ownership, without overlapping old work.
   if (live.suspendedId === ending) {
@@ -181,7 +189,7 @@ async function refresh($: EngineInterface, live: Live, drawing = false): Promise
   if (!await enterSession($, live)) {
     // Watch for the new session id; once the polls run out, enterSession
     // treats an unchanged id as the same session resumed.
-    if (!live.ended && !live.clearing) {
+    if (!live.ended && !live.clearing && live.suspendedPolls < SUSPENDED_POLLS) {
       live.suspendedPolls++
       requestRefresh($, live, INITIAL_MS)
     }
@@ -299,8 +307,9 @@ async function tick($: EngineInterface, live: Live, generation: number): Promise
     }
     const decorations = await run($, live, command, rows, columns, generation)
     if (decorations === undefined) return
-    live.output = { generation, decorations }
-    await write($, live, decorations, generation)
+    const seq = ++live.outputSeq
+    live.output = { generation, seq, decorations }
+    await write($, live, decorations, generation, false, seq)
   } catch (error) {
     // Unexpected host failures retain the last successful result.
     $.ui.log(`subagent-statusline: tick failed: ${String(error)}`, { to: 'debug' })
@@ -415,33 +424,41 @@ function parse($: EngineInterface, stdout: string, ids: ReadonlySet<string>): De
   return decorations
 }
 
-async function write($: EngineInterface, live: Live, decorations: Decorations, generation: number, force = false): Promise<void> {
+async function write(
+  $: EngineInterface, live: Live, decorations: Decorations, generation: number,
+  force = false, seq?: number,
+): Promise<void> {
+  // Stale once a newer generation took over or, for a command's output, once
+  // a newer run's output exists. A stale write never retries.
+  const stale = () => generation !== live.generation ||
+    (seq !== undefined && live.output?.seq !== seq)
   // Every write is versioned, so a write delayed inside the host misses once
-  // another write has landed. A miss is retried while this generation is
-  // current; a reset also writes an already-empty value, so the version
-  // advances and a delayed publication misses.
+  // another write has landed. A reset also writes an already-empty value, so
+  // the version advances and a delayed publication misses.
   for (let attempt = 0; attempt < WRITE_ATTEMPTS; attempt++) {
     const { value = {}, version } = await $.state.get(DECORATIONS)
-    if (generation !== live.generation) return
+    if (stale()) return
     if (!force && sameDecorations(value, decorations)) return
     const result = await $.state.set(DECORATIONS, decorations, { ifVersion: version })
     if (result.isSet) {
-      // Landed after a newer generation took over (a delayed clear): put that
-      // generation's output back.
-      if (generation !== live.generation) await republish($, live)
+      // Landed after it went stale (a delayed clear or an older run's output):
+      // put the latest output back.
+      if (stale()) await republish($, live)
       return
     }
-    if (generation !== live.generation) return
+    if (stale()) return
   }
-  // Every attempt missed while this generation is current: write without a
-  // version rather than leave old output in place.
-  if (force) await $.state.set(DECORATIONS, decorations)
+  if (!force) return
+  // A reset missed every attempt while still current: write without a version
+  // rather than leave old output in place, then check the same way.
+  await $.state.set(DECORATIONS, decorations)
+  if (stale()) await republish($, live)
 }
 
 async function republish($: EngineInterface, live: Live): Promise<void> {
   const output = live.output
   if (output && output.generation === live.generation) {
-    await write($, live, output.decorations, output.generation)
+    await write($, live, output.decorations, output.generation, false, output.seq)
   }
 }
 
