@@ -456,17 +456,102 @@ test('a delayed clear does not erase output published after the command is enabl
   expect(await textOf(ui)).toBe('fresh')
 })
 
-test('a resume that keeps the same session id restarts on the next turn and stops polling', async ($, on) => {
+test('a resume that keeps the same session id resumes without a new turn, with bounded polling', async ($, on) => {
   const h = engine(on)
   const ui = await $.ui.mount(row())
   await h.clock.advance(300)
   await $.session.end({ reason: 'resume', sessionId: 'session-1', resume: { id: 'session-1' } })
-  await h.clock.advance(60000)
-  expect(h.calls).toHaveLength(1)
-  expect(h.idReads).toBeLessThan(40)
-  h.answer = () => output('resumed')
-  await $.turn.start({ text: '', turnId: 'turn-2' })
   await h.clock.advance(300)
-  expect(h.calls).toHaveLength(2)
+  expect(h.calls).toHaveLength(1)
+  h.answer = () => output('resumed')
+  await h.clock.advance(4000)
+  expect(h.calls.length).toBeGreaterThan(1)
   expect(await textOf(ui)).toBe('resumed')
+  expect(h.idReads).toBeLessThan(20)
+})
+
+test('a subagent turn while /clear is still ending does not restart the command', async ($, on) => {
+  const h = engine(on)
+  const stall = deferred<void>()
+  let armed = false
+  on('state.set', { plugin: 'subagent-statusline', key: 'decorations' }, async (_, e, next) => {
+    if (armed && Object.keys(e.value).length === 0) { armed = false; await stall.promise }
+    return next(e)
+  })
+  await $.ui.mount(row())
+  await h.clock.advance(300)
+  armed = true
+  const ending = $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+  await h.clock.settle()
+  await $.turn.start({ text: '', turnId: 'turn-child', agentId: 'a' })
+  await h.clock.advance(2000)
+  expect(h.calls).toHaveLength(1)
+  stall.resolve()
+  await ending
+  h.sessionId = 'session-2'
+  await h.clock.advance(600)
+  expect(h.calls).toHaveLength(2)
+  expect(JSON.parse(h.calls[1]!.init.stdin).session_id).toBe('session-2')
+})
+
+test('a delayed clear does not erase identical output published after re-enabling', async ($, on) => {
+  const h = engine(on)
+  const stall = deferred<void>()
+  let armed = false
+  on('state.set', { plugin: 'subagent-statusline', key: 'decorations' }, async (_, e, next) => {
+    if (armed && Object.keys(e.value).length === 0) { armed = false; await stall.promise }
+    return next(e)
+  })
+  const ui = await $.ui.mount(row())
+  await h.clock.advance(300)
+  armed = true
+  h.policy.disableAllHooks = true
+  await ui.redraw()
+  await h.clock.settle()
+  h.policy = {}
+  await ui.redraw()
+  await h.clock.advance(300)
+  stall.resolve()
+  await h.clock.settle()
+  expect(await textOf(ui)).toBe('decorated')
+})
+
+test('a delayed clear landing during a publication does not win', async ($, on) => {
+  const h = engine(on)
+  const clearStall = deferred<void>()
+  const publishStall = deferred<void>()
+  let clearArmed = false
+  let publishArmed = false
+  on('state.set', { plugin: 'subagent-statusline', key: 'decorations' }, async (_, e, next) => {
+    if (clearArmed && Object.keys(e.value).length === 0) { clearArmed = false; await clearStall.promise }
+    else if (publishArmed && e.value.a === 'fresh') { publishArmed = false; await publishStall.promise }
+    return next(e)
+  })
+  const ui = await $.ui.mount(row())
+  await h.clock.advance(300)
+  clearArmed = true
+  h.policy.disableAllHooks = true
+  await ui.redraw()
+  await h.clock.settle()
+  h.policy = {}
+  h.answer = () => output('fresh')
+  publishArmed = true
+  await ui.redraw()
+  await h.clock.advance(300)
+  clearStall.resolve()
+  await h.clock.settle()
+  publishStall.resolve()
+  await h.clock.settle()
+  expect(await textOf(ui)).toBe('fresh')
+})
+
+test('without a command, row draws read no state', { options: { command: '' } }, async ($, on) => {
+  engine(on)
+  let reads = 0
+  on('state.get', { plugin: 'subagent-statusline', key: 'decorations' }, (_, e, next) => { reads++; return next(e) })
+  const ui = await $.ui.mount(row())
+  const before = reads
+  for (let i = 0; i < 50; i++) await ui.redraw()
+  expect(reads - before).toBe(0)
+  expect(await textOf(ui)).toBe('engine columns')
 })

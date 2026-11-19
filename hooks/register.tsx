@@ -10,9 +10,10 @@ const INITIAL_MS = 300
 // elapsed time. Claude Code runs a legacy subagentStatusLine itself.
 const REFRESH_MS = 1000
 const TIMEOUT_MS = 5000
-const RESET_ATTEMPTS = 3
-// Polls for a new session id after /clear or resume: about 10 seconds.
-const SUSPENDED_POLLS = 33
+const WRITE_ATTEMPTS = 3
+// Polls for a new session id after /clear or resume, about 3 seconds. If the
+// id has not changed by then, the same session was resumed and the mod goes on.
+const SUSPENDED_POLLS = 10
 type Timer = { cancel: () => void }
 type Command = { text: string; own: boolean }
 type Live = {
@@ -26,6 +27,8 @@ type Live = {
   ended: boolean
   suspendedId?: string
   suspendedPolls: number
+  clearing: boolean
+  output?: { generation: number; decorations: Decorations }
   clear?: Timer
   wake?: Timer
   initial?: Timer
@@ -44,6 +47,7 @@ export const register: Register = (on, options) => {
     generation: 0,
     scope: 0,
     suspendedPolls: 0,
+    clearing: false,
     busy: false,
     enabled: false,
     ended: false,
@@ -65,10 +69,15 @@ export const register: Register = (on, options) => {
     live.ended = e.reason !== 'clear' && e.reason !== 'resume'
     live.suspendedId = live.ended ? undefined : e.sessionId
     live.suspendedPolls = 0
-    await write($, live, {}, live.generation, true)
-    const result = await next(e)
-    if (!live.ended) requestRefresh($, live)
-    return result
+    // Nothing restarts until the engine has finished ending the session.
+    live.clearing = true
+    try {
+      await write($, live, {}, live.generation, true)
+      return await next(e)
+    } finally {
+      live.clearing = false
+      if (!live.ended) requestRefresh($, live)
+    }
   })
 
   // These events restart discovery even if no AgentRow is redrawn. Settings
@@ -79,9 +88,10 @@ export const register: Register = (on, options) => {
     return result
   }).catch((_, e, next) => next(e))
   on('turn.start', ($, e, next) => {
-    // A turn after /clear or resume means a session is live again, even when
-    // its id did not change (a resume of the same session).
-    if (live.suspendedId !== undefined) {
+    // A main-loop turn after /clear or resume means a session is live again,
+    // even when its id did not change (a resume of the same session). A
+    // subagent's turn says nothing about which session is live.
+    if (live.suspendedId !== undefined && !live.clearing && e.agentId === undefined) {
       reset(live)
       live.suspendedId = undefined
     }
@@ -95,6 +105,9 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'AgentRow' }, async ($, e, next) => {
+    // Without its own command the mod never changes a row. The option is fixed
+    // for this registration, so stock rows are left alone entirely.
+    if (live.ownCommand.trim() === '') return next(e)
     // Subscribe even while disabled or delegated: publishing later must redraw
     // an already-mounted row, not wait for unrelated host activity.
     const scope = live.scope
@@ -137,10 +150,11 @@ function reset(live: Live): void {
 }
 
 async function enterSession($: EngineInterface, live: Live): Promise<boolean> {
-  if (live.ended) return false
+  if (live.ended || live.clearing) return false
   const ending = live.suspendedId
   if (ending === undefined) return true
-  if (await $.session.id() === ending) return false
+  // Same id after the polls ran out: the same session was resumed.
+  if (await $.session.id() === ending && live.suspendedPolls < SUSPENDED_POLLS) return false
   // /clear and in-process resume do not emit session.start. Their next session
   // has new timer/sample/measurement ownership, without overlapping old work.
   if (live.suspendedId === ending) {
@@ -165,9 +179,12 @@ async function refresh($: EngineInterface, live: Live, drawing = false): Promise
   // and settings reads that every row draw would otherwise make.
   if (live.ownCommand.trim() === '') return
   if (!await enterSession($, live)) {
-    // Watch for the new session id for a while; after that, the next turn or
-    // row draw ends the suspension.
-    if (!live.ended && live.suspendedPolls++ < SUSPENDED_POLLS) requestRefresh($, live, INITIAL_MS)
+    // Watch for the new session id; once the polls run out, enterSession
+    // treats an unchanged id as the same session resumed.
+    if (!live.ended && !live.clearing) {
+      live.suspendedPolls++
+      requestRefresh($, live, INITIAL_MS)
+    }
     return
   }
   const generation = live.generation
@@ -281,7 +298,9 @@ async function tick($: EngineInterface, live: Live, generation: number): Promise
       return
     }
     const decorations = await run($, live, command, rows, columns, generation)
-    if (decorations !== undefined) await write($, live, decorations, generation)
+    if (decorations === undefined) return
+    live.output = { generation, decorations }
+    await write($, live, decorations, generation)
   } catch (error) {
     // Unexpected host failures retain the last successful result.
     $.ui.log(`subagent-statusline: tick failed: ${String(error)}`, { to: 'debug' })
@@ -397,32 +416,39 @@ function parse($: EngineInterface, stdout: string, ids: ReadonlySet<string>): De
 }
 
 async function write($: EngineInterface, live: Live, decorations: Decorations, generation: number, force = false): Promise<void> {
-  const { value = {}, version } = await $.state.get(DECORATIONS)
-  if (generation !== live.generation) return
-  const keys = Object.keys(value)
-  if (!force && keys.length === Object.keys(decorations).length && keys.every(key =>
-    Object.hasOwn(decorations, key) && value[key] === decorations[key],
-  )) return
-  // A publication writes only over the version it read, so it misses once a
-  // reset has written.
-  if (!force) {
-    await $.state.set(DECORATIONS, decorations, { ifVersion: version })
-    return
+  // Every write is versioned, so a write delayed inside the host misses once
+  // another write has landed. A miss is retried while this generation is
+  // current; a reset also writes an already-empty value, so the version
+  // advances and a delayed publication misses.
+  for (let attempt = 0; attempt < WRITE_ATTEMPTS; attempt++) {
+    const { value = {}, version } = await $.state.get(DECORATIONS)
+    if (generation !== live.generation) return
+    if (!force && sameDecorations(value, decorations)) return
+    const result = await $.state.set(DECORATIONS, decorations, { ifVersion: version })
+    if (result.isSet) {
+      // Landed after a newer generation took over (a delayed clear): put that
+      // generation's output back.
+      if (generation !== live.generation) await republish($, live)
+      return
+    }
+    if (generation !== live.generation) return
   }
-  // A reset writes even an already-empty value, so the version advances and a
-  // delayed publication misses. It is versioned too: a reset delayed inside
-  // the host must miss once a newer generation has published. When an older
-  // publication that was already inside the host beats it, it tries again over
-  // that write's version while its own generation is still current.
-  let current = version
-  for (let attempt = 0; attempt < RESET_ATTEMPTS; attempt++) {
-    const result = await $.state.set(DECORATIONS, decorations, { ifVersion: current })
-    if (result.isSet || generation !== live.generation) return
-    current = result.version
-  }
-  // Every attempt missed and no newer generation exists: write without a
+  // Every attempt missed while this generation is current: write without a
   // version rather than leave old output in place.
-  await $.state.set(DECORATIONS, decorations)
+  if (force) await $.state.set(DECORATIONS, decorations)
+}
+
+async function republish($: EngineInterface, live: Live): Promise<void> {
+  const output = live.output
+  if (output && output.generation === live.generation) {
+    await write($, live, output.decorations, output.generation)
+  }
+}
+
+function sameDecorations(a: Decorations, b: Decorations): boolean {
+  const keys = Object.keys(a)
+  return keys.length === Object.keys(b).length &&
+    keys.every(key => Object.hasOwn(b, key) && a[key] === b[key])
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
