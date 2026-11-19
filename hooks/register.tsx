@@ -2,328 +2,366 @@ import type { AgentInfo, EngineInterface, Register, RenderSurface } from 'claude
 
 import type { Decorations } from '../types'
 
-// Stock Claude Code 2.1.326's command protocol, adapted to public Mods APIs.
-// AgentRow still owns rendering, selection and navigation.
+// Stock Claude Code 2.1.326's subagentStatusLine command protocol, on public mod
+// APIs. AgentRow still draws the rows and owns selection and navigation.
+//
+// One worker does all the work. Hooks only record what changed and wake it.
+// The worker's jobs run one at a time from a queue, and every state write
+// happens inside a job, so writes land in the order the jobs ran. Running the
+// command is the one step outside the queue; its output is published by a
+// later job, which drops it if anything changed while the command ran.
+
 const DECORATIONS = { plugin: 'subagent-statusline', key: 'decorations' } as const
+/** Delay of the first run after the row count or width changes. */
 const INITIAL_MS = 300
-// The mod's own command runs every second, the rate at which stock rows update
-// elapsed time. Claude Code runs a legacy subagentStatusLine itself.
+/** The mod's own command runs every second, as often as stock rows update. */
 const REFRESH_MS = 1000
 const TIMEOUT_MS = 5000
-const WRITE_ATTEMPTS = 3
-// Polls for a new session id after /clear or resume, about 3 seconds. After a
-// resume, an unchanged id by then means the same session goes on. After
-// /clear, later row draws and turns keep checking for the new id.
-const SUSPENDED_POLLS = 10
+/** After /clear or resume, how often and how many times to check the session id. */
+const SESSION_POLL_MS = 300
+const SESSION_POLLS = 10
+
 type Timer = { cancel: () => void }
-type Command = { text: string; own: boolean }
+type Job = () => Promise<void>
+type Ending = {
+  id: string
+  reason: string
+  /** True while the session.end hook runs. */
+  isActive: boolean
+  /** A main-loop turn started after a resume. */
+  isTurnSeen: boolean
+  polls: number
+}
 type Live = {
   ownCommand: string
-  columns: number
+  /** The session the worker runs for; undefined until confirmed. */
+  session?: string
+  ending?: Ending
+  isExited: boolean
+  /** Bumped by every change that makes a running or queued command stale. */
+  epoch: number
   count: number
-  generation: number
-  scope: number
-  busy: boolean
-  enabled: boolean
-  ended: boolean
-  suspendedId?: string
-  suspendedPolls: number
-  clearing: boolean
-  output?: { generation: number; seq: number; decorations: Decorations }
-  outputSeq: number
-  endReason?: string
-  clear?: Timer
-  wake?: Timer
+  columns: number
+  isEnabled: boolean
+  isBusy: boolean
   initial?: Timer
   periodic?: Timer
-  listing?: Promise<AgentInfo[]>
+  poll?: Timer
+  wake?: Timer
+  isRefreshQueued: boolean
+  queue: Promise<void>
+  rowIds: string
   widths: Map<RenderSurface, Map<string, number>>
   samples: Map<string, number[]>
+  shown?: Decorations
 }
 
 export const register: Register = (on, options) => {
-  // Per registration, not per module: sessions must not share timers or samples.
+  // Per registration, not per module: sessions never share timers or samples.
   const live: Live = {
     ownCommand: typeof options.command === 'string' ? options.command : '',
-    columns: 0,
+    isExited: false,
+    epoch: 0,
     count: 0,
-    generation: 0,
-    scope: 0,
-    suspendedPolls: 0,
-    clearing: false,
-    outputSeq: 0,
-    busy: false,
-    enabled: false,
-    ended: false,
+    columns: 0,
+    isEnabled: false,
+    isBusy: false,
+    isRefreshQueued: false,
+    queue: Promise.resolve(),
+    rowIds: '',
     widths: new Map(),
     samples: new Map(),
   }
+  // Without its own command the mod does nothing at all: every hook passes on.
+  const isOff = live.ownCommand.trim() === ''
 
   on('session.start', async ($, e, next) => {
-    reset(live)
-    live.ended = false
-    live.suspendedId = undefined
-    await write($, live, {}, live.generation, true)
-    await refresh($, live)
+    if (isOff) return next(e)
+    stop(live)
+    live.session = undefined
+    live.ending = undefined
+    live.isExited = false
+    void enqueue($, live, () => publish($, live, {}))
+    requestRefresh($, live)
     return next(e)
   })
 
   on('session.end', async ($, e, next) => {
-    reset(live)
-    live.ended = e.reason !== 'clear' && e.reason !== 'resume'
-    live.suspendedId = live.ended ? undefined : e.sessionId
-    live.endReason = e.reason
-    live.suspendedPolls = 0
-    // Nothing restarts until the engine has finished ending the session.
-    live.clearing = true
+    if (isOff) return next(e)
+    stop(live)
+    live.session = undefined
+    live.isExited = e.reason !== 'clear' && e.reason !== 'resume'
+    live.ending = live.isExited ? undefined
+      : { id: e.sessionId, reason: e.reason, isActive: true, isTurnSeen: false, polls: 0 }
+    void enqueue($, live, () => publish($, live, {}))
     try {
-      await write($, live, {}, live.generation, true)
       return await next(e)
     } finally {
-      live.clearing = false
-      if (!live.ended) requestRefresh($, live)
+      if (live.ending) live.ending.isActive = false
+      requestRefresh($, live)
     }
   })
 
-  // These events restart discovery even if no AgentRow is redrawn. Settings
-  // reads of individual sources (including our own) must not create a loop.
+  // Settings changes, new turns and a surface going away can change what runs,
+  // without any row being drawn again.
   on('settings.read', async ($, e, next) => {
     const result = await next(e)
-    if (e.source === undefined) requestRefresh($, live)
+    if (e.source === undefined && !isOff) requestRefresh($, live)
     return result
   }).catch((_, e, next) => next(e))
   on('turn.start', ($, e, next) => {
-    // A main-loop turn after a resume means the session is live again, even
-    // when its id did not change. After /clear the mod waits for the new id.
-    // A subagent's turn says nothing about which session is live.
-    if (live.suspendedId !== undefined && !live.clearing && e.agentId === undefined &&
-      live.endReason === 'resume') {
-      reset(live)
-      live.suspendedId = undefined
+    if (isOff) return next(e)
+    // A main-loop turn after a resume means the session goes on, even under the
+    // same id. A subagent's turn says nothing about which session is live.
+    if (e.agentId === undefined && live.ending?.reason === 'resume' && !live.ending.isActive) {
+      live.ending.isTurnSeen = true
     }
     requestRefresh($, live)
     return next(e)
   })
   on('session.detach', ($, e, next) => {
+    if (isOff) return next(e)
     live.widths.delete(e.surface)
     requestRefresh($, live)
     return next(e)
   })
 
   on('ui.render', { component: 'AgentRow' }, async ($, e, next) => {
-    // Without its own command the mod never changes a row. The option is fixed
-    // for this registration, so stock rows are left alone entirely.
-    if (live.ownCommand.trim() === '') return next(e)
-    // Subscribe even while disabled or delegated: publishing later must redraw
-    // an already-mounted row, not wait for unrelated host activity.
-    const scope = live.scope
+    if (isOff) return next(e)
+    // Reading the state subscribes the row, so a later publish redraws it.
     const { value } = await $.state.get(DECORATIONS)
-    // Record the width before the session check: a row drawn between /clear and
-    // the new session id still supplies the next session's width.
-    if (typeof e.props.columns === 'number' && Number.isFinite(e.props.columns)) {
+    const { id, columns, rowIds } = e.props
+    let isChanged = false
+    if (typeof columns === 'number' && Number.isFinite(columns)) {
       let widths = live.widths.get(e.surface)
       if (!widths) live.widths.set(e.surface, widths = new Map())
-      widths.set(e.props.id, Math.max(0, e.props.columns))
+      if (widths.get(id) !== Math.max(0, columns)) {
+        // A new width makes output computed for the old one stale.
+        widths.set(id, Math.max(0, columns))
+        live.epoch++
+        isChanged = true
+      }
     }
-    if (!await enterSession($, live)) return next(e)
-    try {
-      await refresh($, live, true)
-    } catch (error) {
-      $.ui.log(`subagent-statusline: row refresh failed: ${String(error)}`, { to: 'debug' })
+    const ids = [...rowIds].sort().join('\n')
+    if (ids !== live.rowIds) {
+      // Rows came or went: output computed for the old rows is stale.
+      live.rowIds = ids
+      live.epoch++
+      isChanged = true
     }
-    if (scope !== live.scope || !live.enabled || live.ended || live.suspendedId !== undefined) return next(e)
-    const body = value && Object.hasOwn(value, e.props.id) ? value[e.props.id] : undefined
-    // Do not replace the node: the host's row keeps its pointer, ANSI handling,
-    // truncation, hover and click behavior. requestId is not an agent identity.
+    if (isChanged) requestRefresh($, live)
+
+    if (live.session === undefined || !live.isEnabled) return next(e)
+    const body = value && Object.hasOwn(value, id) ? value[id] : undefined
+    // The host's row is kept: only its body and visibility change.
     return body === undefined ? next(e) : next({
       ...e, props: { ...e.props, body: body === '' ? undefined : body, isHidden: body === '' },
     })
   })
 }
 
-function reset(live: Live): void {
-  cancel(live)
-  live.scope++
-  live.wake?.cancel()
-  live.wake = undefined
+/** Cancels the timers and makes any running or queued command output stale. */
+function stop(live: Live): void {
+  live.epoch++
+  live.initial?.cancel()
+  live.periodic?.cancel()
+  live.poll?.cancel()
+  live.initial = live.periodic = live.poll = undefined
   live.count = 0
-  live.enabled = false
+  live.isEnabled = false
   live.samples.clear()
-  live.listing = undefined
-  // Widths are kept: after /clear or resume no row may redraw, and the first
-  // command of the new session must not get columns: 0. refresh() drops the
-  // widths of rows that are gone.
 }
 
-async function enterSession($: EngineInterface, live: Live): Promise<boolean> {
-  if (live.ended || live.clearing) return false
-  const ending = live.suspendedId
-  if (ending === undefined) return true
-  // After /clear, wait for the new session id. After a resume, an id that is
-  // unchanged once the polls run out means the same session was resumed.
-  if (await $.session.id() === ending &&
-    (live.endReason !== 'resume' || live.suspendedPolls < SUSPENDED_POLLS)) return false
-  // /clear and in-process resume do not emit session.start. Their next session
-  // has new timer/sample/measurement ownership, without overlapping old work.
-  if (live.suspendedId === ending) {
-    reset(live)
-    live.suspendedId = undefined
-  }
-  return !live.ended && live.suspendedId === undefined
+function enqueue($: EngineInterface, live: Live, job: Job): Promise<void> {
+  live.queue = live.queue.then(job).catch(error => {
+    $.ui.log(`subagent-statusline: ${String(error)}`, { to: 'debug' })
+  })
+  return live.queue
 }
 
-function requestRefresh($: EngineInterface, live: Live, delay = 0): void {
-  if (live.ended || live.wake) return
-  live.wake = $.clock.after(delay, () => {
+/**
+ * Queues one refresh, from a timer so it never runs inside the dispatch that
+ * asked for it (a row draw may not write state).
+ */
+function requestRefresh($: EngineInterface, live: Live): void {
+  if (live.isExited || live.wake || live.isRefreshQueued) return
+  live.wake = $.clock.after(0, () => {
     live.wake = undefined
-    void refresh($, live).catch(error => {
-      $.ui.log(`subagent-statusline: refresh failed: ${String(error)}`, { to: 'debug' })
+    live.isRefreshQueued = true
+    void enqueue($, live, async () => {
+      live.isRefreshQueued = false
+      await refresh($, live)
     })
   })
 }
 
-async function refresh($: EngineInterface, live: Live, drawing = false): Promise<void> {
-  // Without its own command the mod never runs anything: skip the agent list
-  // and settings reads that every row draw would otherwise make.
-  if (live.ownCommand.trim() === '') return
-  if (!await enterSession($, live)) {
-    // Watch for the new session id; once the polls run out, enterSession
-    // treats an unchanged id as the same session resumed.
-    if (!live.ended && !live.clearing && live.suspendedPolls < SUSPENDED_POLLS) {
-      live.suspendedPolls++
-      requestRefresh($, live, INITIAL_MS)
+/** Confirms which session is live. False while waiting for one. */
+async function confirmSession($: EngineInterface, live: Live): Promise<boolean> {
+  if (live.isExited) return false
+  if (live.session !== undefined) return true
+  const ending = live.ending
+  if (ending?.isActive) return false
+  const id = await $.session.id()
+  if (ending && id === ending.id) {
+    // After /clear, wait for the new session's id. After a resume, the same
+    // session goes on once a main-loop turn starts or the polls run out.
+    const isSameSession = ending.reason === 'resume' &&
+      (ending.isTurnSeen || ending.polls >= SESSION_POLLS)
+    if (!isSameSession) {
+      if (ending.polls < SESSION_POLLS && !live.poll) {
+        ending.polls++
+        live.poll = $.clock.after(SESSION_POLL_MS, () => {
+          live.poll = undefined
+          requestRefresh($, live)
+        })
+      }
+      return false
     }
-    return
   }
-  const generation = live.generation
-  const rows = await agents($, live)
-  const command = await resolveCommand($, live)
-  if (live.ended) return
-  if (generation !== live.generation) {
-    // Timers restarted meanwhile (a tick saw a new row count). Run again so a
-    // width measured by this draw is not lost.
-    requestRefresh($, live)
-    return
-  }
+  live.session = id
+  live.ending = undefined
+  return true
+}
+
+/** Runs inside a job: lists the rows, reads the policy, starts or stops the timers. */
+async function refresh($: EngineInterface, live: Live): Promise<void> {
+  if (!await confirmSession($, live)) return
+  const rows = await agents($)
+  const isEnabled = await isCommandAllowed($)
   const ids = new Set(rows.map(row => row.id))
   for (const widths of live.widths.values())
     for (const id of widths.keys()) if (!ids.has(id)) widths.delete(id)
-  // Surfaces are tried in a fixed order, terminal first. On the first surface
-  // that measured any listed row, a top-level row's width wins. A redraw on
-  // another surface, or a row with no measurement, leaves the width unchanged.
-  let columns = live.columns
+  await schedule($, live, rows.length, columnsFor(live, rows), isEnabled)
+}
+
+/**
+ * The width sent to the command: on the first surface, terminal first, that
+ * measured a listed row, a top-level row's width. Kept when nothing is measured.
+ */
+function columnsFor(live: Live, rows: AgentInfo[]): number {
+  const ids = new Set(rows.map(row => row.id))
   const surfaces = [...live.widths.keys()].sort((a, b) =>
-    a === 'terminal' ? -1 : b === 'terminal' ? 1 : a.localeCompare(b),
-  )
+    a === 'terminal' ? -1 : b === 'terminal' ? 1 : a.localeCompare(b))
   for (const surface of surfaces) {
     const widths = live.widths.get(surface)!
-    const leader = rows.find(row => (!row.parentId || !ids.has(row.parentId)) && widths.has(row.id)) ??
+    const row = rows.find(row => (!row.parentId || !ids.has(row.parentId)) && widths.has(row.id)) ??
       rows.find(row => widths.has(row.id))
-    if (leader) { columns = widths.get(leader.id)!; break }
+    if (row) return widths.get(row.id)!
   }
-  // Legacy/policy commands belong to the native host, even before its first
-  // asynchronous body arrives. Only a resolved mod-owned command is ours.
-  await schedule($, live, rows.length, columns, command?.own === true, drawing)
+  return live.columns
 }
 
-function cancel(live: Live): void {
-  live.generation++
+/** Runs inside a job. Restarts the timers when the count, width or permission changed. */
+async function schedule(
+  $: EngineInterface, live: Live, count: number, columns: number, isEnabled: boolean,
+): Promise<void> {
+  if (live.count === count && live.columns === columns && live.isEnabled === isEnabled) return
+  live.epoch++
   live.initial?.cancel()
   live.periodic?.cancel()
-  live.clear?.cancel()
-  live.clear = undefined
-  live.initial = undefined
-  live.periodic = undefined
-}
-
-async function agents($: EngineInterface, live: Live): Promise<AgentInfo[]> {
-  // Concurrent row draws share one read. hasRow is the host's producer
-  // eligibility, including retained/completed and command-hidden rows.
-  const listing = (live.listing ??= $.agent.list().then(rows => rows.filter(
-    row => row.hasRow && row.kind === 'local_agent' && row.type !== 'main-session',
-  )))
-  try {
-    return await listing
-  } finally {
-    if (live.listing === listing) live.listing = undefined
-  }
-}
-
-async function schedule(
-  $: EngineInterface,
-  live: Live,
-  count: number,
-  columns: number,
-  enabled = live.enabled,
-  drawing = false,
-): Promise<void> {
-  // Refresh inputs are producer count and width, not identities/status.
-  if (live.count === count && live.columns === columns && live.enabled === enabled) return
-  cancel(live)
+  live.initial = live.periodic = undefined
   live.count = count
   live.columns = columns
-  live.enabled = enabled
+  live.isEnabled = isEnabled
   if (count === 0) live.samples.clear()
-  if (count === 0 || !enabled) {
-    const generation = live.generation
-    if (!drawing) {
-      await write($, live, {}, generation, true)
-      return
-    }
-    // schedule is also reached while drawing. State writes there are denied:
-    // return the native row immediately, then clear from a timer context.
-    live.clear = $.clock.after(0, () => {
-      live.clear = undefined
-      void write($, live, {}, generation, true).catch(error => {
-        $.ui.log(`subagent-statusline: clear failed: ${String(error)}`, { to: 'debug' })
-      })
-    })
+  if (count === 0 || !isEnabled) {
+    await publish($, live, {})
     return
   }
-  const generation = live.generation
-  live.initial = $.clock.after(INITIAL_MS, () => { void tick($, live, generation) })
-  live.periodic = $.clock.every(REFRESH_MS, () => { void tick($, live, generation) })
+  live.initial = $.clock.after(INITIAL_MS, () => tick($, live))
+  live.periodic = $.clock.every(REFRESH_MS, () => tick($, live))
 }
 
-async function tick($: EngineInterface, live: Live, generation: number): Promise<void> {
-  if (live.busy || live.ended || live.suspendedId !== undefined || generation !== live.generation) return
-  live.busy = true
-  try {
-    const rows = await agents($, live)
-    if (live.ended || generation !== live.generation) return
-    if (rows.length !== live.count) {
-      await schedule($, live, rows.length, live.columns)
-      return
-    }
-    sample(live, rows)
-    const columns = live.columns
-    const command = await resolveCommand($, live)
-    // A /clear or restart during the settings read makes this refresh obsolete:
-    // it must not start the command, not only have its output dropped.
-    if (live.ended || generation !== live.generation) return
-    if (command?.own !== true) {
-      await schedule($, live, rows.length, columns, false)
-      return
-    }
-    const decorations = await run($, live, command, rows, columns, generation)
-    if (decorations === undefined) return
-    const seq = ++live.outputSeq
-    live.output = { generation, seq, decorations }
-    await write($, live, decorations, generation, false, seq)
-  } catch (error) {
-    // Unexpected host failures retain the last successful result.
-    $.ui.log(`subagent-statusline: tick failed: ${String(error)}`, { to: 'debug' })
-  } finally {
-    live.busy = false
-    // Rows can disappear while the shell runs, without another AgentRow draw.
-    try {
-      if (!live.ended && generation === live.generation && (await agents($, live)).length === 0) {
-        await schedule($, live, 0, live.columns)
-      }
-    } catch (error) {
-      $.ui.log(`subagent-statusline: cleanup failed: ${String(error)}`, { to: 'debug' })
-    }
+/** A timer firing. Skipped while the command is still running. */
+function tick($: EngineInterface, live: Live): void {
+  if (live.isBusy || live.session === undefined) return
+  live.isBusy = true
+  void runOnce($, live).finally(() => { live.isBusy = false })
+}
+
+async function runOnce($: EngineInterface, live: Live): Promise<void> {
+  const epoch = live.epoch
+  let plan: Plan | undefined
+  await enqueue($, live, async () => { plan = await prepare($, live, epoch) })
+  if (!plan) return
+  const { sessionId } = plan
+  // A session end or row change between the job and this line still stops it.
+  if (live.epoch !== epoch || live.session !== sessionId) return
+  const decorations = await execute($, plan)
+  await enqueue($, live, async () => {
+    if (live.epoch !== epoch || live.session !== sessionId) return
+    await publish($, live, decorations)
+    // Rows can go away while the command runs, with no row drawn again.
+    if ((await agents($)).length === 0) await schedule($, live, 0, live.columns, live.isEnabled)
+  })
+}
+
+type Plan = {
+  sessionId: string
+  rows: AgentInfo[]
+  input: unknown
+  command: string
+  cwd: string
+  env: Record<string, string>
+}
+
+/** Runs inside a job: everything the command needs, or nothing if it is stale. */
+async function prepare($: EngineInterface, live: Live, epoch: number): Promise<Plan | undefined> {
+  const isCurrent = () => live.epoch === epoch && live.session !== undefined
+  if (!isCurrent()) return
+  const rows = await agents($)
+  if (!isCurrent()) return
+  if (rows.length !== live.count) {
+    await refresh($, live)
+    return
   }
+  if (!await isCommandAllowed($)) {
+    await schedule($, live, live.count, live.columns, false)
+    return
+  }
+  const [sessionId, info, cwd, env] = await Promise.all([
+    $.session.id(), $.session.info(), $.session.cwd(), $.process.hookEnv(),
+  ])
+  if (!isCurrent() || sessionId !== live.session) return
+  sample(live, rows)
+  return {
+    sessionId, rows, command: live.ownCommand, cwd: info.configRoot ?? cwd, env,
+    input: {
+      session_id: sessionId, transcript_path: info.transcriptPath, cwd,
+      ...(info.scratchpadDir !== undefined && { scratchpad_dir: info.scratchpadDir }),
+      ...(info.promptId !== undefined && { prompt_id: info.promptId }),
+      ...(info.agentType !== undefined && { agent_type: info.agentType }),
+      // AgentRow's columns is already the body width.
+      columns: live.columns,
+      tasks: rows.map(row => ({
+        id: row.id, name: row.name, type: row.kind, agentType: row.type,
+        status: row.taskStatus, description: row.description,
+        label: row.label || row.description, startTime: row.startTime,
+        model: row.model, effort: row.effort,
+        contextWindowSize: row.model ? row.contextWindowSize : undefined,
+        tokenCount: row.tokenCount ?? 0, tokenSamples: live.samples.get(row.id) ?? [],
+        cwd: row.cwd ?? cwd,
+      })),
+    },
+  }
+}
+
+/** Runs the command outside the queue. Any failure restores the stock rows. */
+async function execute($: EngineInterface, plan: Plan): Promise<Decorations> {
+  let result
+  try {
+    result = await $.process.run(['/bin/sh', '-c', plan.command], {
+      cwd: plan.cwd, env: plan.env, stdin: JSON.stringify(plan.input), timeoutMs: TIMEOUT_MS,
+    })
+  } catch (error) {
+    $.ui.log(`subagent-statusline: command did not run: ${String(error)}`, { to: 'debug' })
+    return {}
+  }
+  if (result.exitCode !== 0) {
+    $.ui.log(`subagent-statusline: command exited ${result.exitCode}: ${result.stderr.slice(0, 500)}`, { to: 'debug' })
+    return {}
+  }
+  return parse($, result.stdout, new Set(plan.rows.map(row => row.id)))
 }
 
 function sample(live: Live, rows: AgentInfo[]): void {
@@ -337,69 +375,20 @@ function sample(live: Live, rows: AgentInfo[]): void {
   for (const id of live.samples.keys()) if (!ids.has(id)) live.samples.delete(id)
 }
 
-async function resolveCommand($: EngineInterface, live: Live): Promise<Command | undefined> {
-  // Policy wins. Never execute a command supplied by project settings.
-  const policy = await $.settings.read({ source: 'policy' })
-  if (policy.disableAllHooks === true) return
-  let legacy: unknown = policy.subagentStatusLine
-  if (legacy === undefined && policy.allowManagedHooksOnly !== true) {
-    if (live.ownCommand.trim() !== '') return { text: live.ownCommand, own: true }
-    const user = await $.settings.read({ source: 'user' })
-    legacy = user.subagentStatusLine
-  }
-  if (!isRecord(legacy) || legacy.type !== 'command' || typeof legacy.command !== 'string') return
-  return { text: legacy.command, own: false }
+async function agents($: EngineInterface): Promise<AgentInfo[]> {
+  // hasRow includes retained completed rows and rows the command hid.
+  return (await $.agent.list()).filter(row =>
+    row.hasRow && row.kind === 'local_agent' && row.type !== 'main-session')
 }
 
-async function run(
-  $: EngineInterface,
-  live: Live,
-  command: Command,
-  rows: AgentInfo[],
-  columns: number,
-  generation: number,
-): Promise<Decorations | undefined> {
-  const [sessionId, info, cwd, hookEnv] = await Promise.all([
-    $.session.id(), $.session.info(), $.session.cwd(), $.process.hookEnv(),
-  ])
-  // Checked again after these reads, right before the spawn: an obsolete run
-  // would pair the old rows with the new session's id and paths.
-  if (live.ended || generation !== live.generation) return undefined
-  const input = {
-    session_id: sessionId, transcript_path: info.transcriptPath, cwd,
-    ...(info.scratchpadDir !== undefined && { scratchpad_dir: info.scratchpadDir }),
-    ...(info.promptId !== undefined && { prompt_id: info.promptId }),
-    ...(info.agentType !== undefined && { agent_type: info.agentType }),
-    // Public AgentRow.columns is already the body width: don't subtract twice.
-    columns,
-    tasks: rows.map(row => ({
-      id: row.id, name: row.name, type: row.kind, agentType: row.type,
-      status: row.taskStatus, description: row.description,
-      label: row.label || row.description, startTime: row.startTime,
-      model: row.model, effort: row.effort,
-      contextWindowSize: row.model ? row.contextWindowSize : undefined,
-      tokenCount: row.tokenCount ?? 0, tokenSamples: live.samples.get(row.id) ?? [],
-      cwd: row.cwd ?? cwd,
-    })),
-  }
-  // Only the mod's own command reaches here (tick checks command.own), so it
-  // runs with the mod's CLAUDE_PLUGIN_ROOT and CLAUDE_PLUGIN_DATA.
-  let result
-  try {
-    result = await $.process.run(['/bin/sh', '-c', command.text], {
-      cwd: info.configRoot ?? cwd, env: hookEnv, stdin: JSON.stringify(input), timeoutMs: TIMEOUT_MS,
-    })
-  } catch (error) {
-    // process.run throws for spawn failures/timeouts. Like nonzero exits, these
-    // failures must restore the host's default columns.
-    $.ui.log(`subagent-statusline: command did not run: ${String(error)}`, { to: 'debug' })
-    return {}
-  }
-  if (result.exitCode !== 0) {
-    $.ui.log(`subagent-statusline: command exited ${result.exitCode}: ${result.stderr.slice(0, 500)}`, { to: 'debug' })
-    return {}
-  }
-  return parse($, result.stdout, new Set(rows.map(row => row.id)))
+/**
+ * Managed policy decides. A managed subagentStatusLine stays with Claude Code;
+ * disableAllHooks and allowManagedHooksOnly stop the mod's command.
+ */
+async function isCommandAllowed($: EngineInterface): Promise<boolean> {
+  const policy = await $.settings.read({ source: 'policy' })
+  return policy.disableAllHooks !== true && policy.allowManagedHooksOnly !== true &&
+    policy.subagentStatusLine === undefined
 }
 
 function parse($: EngineInterface, stdout: string, ids: ReadonlySet<string>): Decorations {
@@ -417,49 +406,16 @@ function parse($: EngineInterface, stdout: string, ids: ReadonlySet<string>): De
       $.ui.log(`subagent-statusline: line is not {id, content}: ${line.slice(0, 200)}`, { to: 'debug' })
       continue
     }
-    if (ids.has(row.id)) Object.defineProperty(decorations, row.id, {
-      value: row.content, enumerable: true, writable: true, configurable: true,
-    })
+    if (ids.has(row.id)) decorations[row.id] = row.content
   }
   return decorations
 }
 
-async function write(
-  $: EngineInterface, live: Live, decorations: Decorations, generation: number,
-  force = false, seq?: number,
-): Promise<void> {
-  // Stale once a newer generation took over or, for a command's output, once
-  // a newer run's output exists. A stale write never retries.
-  const stale = () => generation !== live.generation ||
-    (seq !== undefined && live.output?.seq !== seq)
-  // Every write is versioned, so a write delayed inside the host misses once
-  // another write has landed. A reset also writes an already-empty value, so
-  // the version advances and a delayed publication misses.
-  for (let attempt = 0; attempt < WRITE_ATTEMPTS; attempt++) {
-    const { value = {}, version } = await $.state.get(DECORATIONS)
-    if (stale()) return
-    if (!force && sameDecorations(value, decorations)) return
-    const result = await $.state.set(DECORATIONS, decorations, { ifVersion: version })
-    if (result.isSet) {
-      // Landed after it went stale (a delayed clear or an older run's output):
-      // put the latest output back.
-      if (stale()) await republish($, live)
-      return
-    }
-    if (stale()) return
-  }
-  if (!force) return
-  // A reset missed every attempt while still current: write without a version
-  // rather than leave old output in place, then check the same way.
+/** Runs inside a job, so writes land in queue order. Skips an unchanged value. */
+async function publish($: EngineInterface, live: Live, decorations: Decorations): Promise<void> {
+  if (live.shown && sameDecorations(live.shown, decorations)) return
   await $.state.set(DECORATIONS, decorations)
-  if (stale()) await republish($, live)
-}
-
-async function republish($: EngineInterface, live: Live): Promise<void> {
-  const output = live.output
-  if (output && output.generation === live.generation) {
-    await write($, live, output.decorations, output.generation, false, output.seq)
-  }
+  live.shown = decorations
 }
 
 function sameDecorations(a: Decorations, b: Decorations): boolean {

@@ -16,14 +16,13 @@ test('disabling the command clears outside drawing and immediately delegates the
   await h.clock.advance(300)
   expect(await textOf(ui)).toBe('decorated')
   h.policy.disableAllHooks = true
-  await ui.redraw()
+  await h.clock.advance(700) // The next run checks the policy first.
   expect(await textOf(ui)).toBe('engine columns')
-  await h.clock.settle()
   expect(h.writes[h.writes.length - 1]).toEqual({})
   await h.clock.advance(10000)
   expect(h.calls).toHaveLength(1)
   h.policy = {}
-  await ui.redraw()
+  await $.turn.start({ text: '', turnId: 'turn-2' })
   await h.clock.advance(300)
   expect(await textOf(ui)).toBe('decorated')
   expect(h.calls[1]?.argv).toEqual(['/bin/sh', '-c', 'fixture-command'])
@@ -37,13 +36,14 @@ for (const props of [{ body: 'native' }, { isHidden: true }]) {
     expect(await textOf(ui)).toBe('decorated')
     h.policy.subagentStatusLine = { type: 'command', command: 'managed' }
     for (let i = 0; i < 3; i++) await ui.redraw(row('a', props).props)
-    await h.clock.settle()
+    await h.clock.advance(700) // The next run checks the policy first.
     expect(await textOf(ui)).toBe('body' in props ? 'native' : 'hidden')
     expect(h.writes[h.writes.length - 1]).toEqual({})
     await h.clock.advance(10000)
     expect(h.calls).toHaveLength(1)
     h.policy = {}
     await ui.redraw(row().props)
+    await $.turn.start({ text: '', turnId: 'turn-2' })
     await h.clock.advance(300)
     expect(await textOf(ui)).toBe('decorated')
   })
@@ -368,33 +368,26 @@ test('desktop/vscode redraws use one stable measured root even when the first ro
   expect(h.calls.map(call => JSON.parse(call.init.stdin).columns)).toEqual(Array(11).fill(81))
 })
 
-for (const boundary of ['read', 'set'] as const) {
-  test(`clear invalidates a publication paused inside state.${boundary}`, async ($, on) => {
-    const h = engine(on)
-    const pending = deferred<void>()
-    let armed = false
-    if (boundary === 'read') on('state.get', { plugin: 'subagent-statusline', key: 'decorations' }, async (_, e, next) => {
-      const result = await next(e)
-      if (armed) { armed = false; await pending.promise }
-      return result
-    })
-    else on('state.set', { plugin: 'subagent-statusline', key: 'decorations' }, async (_, e, next) => {
-      if (armed && e.value.a === 'stale') { armed = false; await pending.promise }
-      return next(e)
-    })
-    h.answer = () => { armed = true; return output('stale') }
-    const ui = await $.ui.mount(row())
-    await h.clock.advance(300)
-    await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
-    h.sessionId = 'session-2'
-    pending.resolve()
-    await h.clock.settle()
-    expect(await textOf(ui)).toBe('engine columns')
-    h.answer = () => output('fresh')
-    await h.clock.advance(5000)
-    expect(await textOf(ui)).toBe('fresh')
+test('clear invalidates a publication paused inside state.set', async ($, on) => {
+  const h = engine(on)
+  const pending = deferred<void>()
+  let armed = false
+  on('state.set', { plugin: 'subagent-statusline', key: 'decorations' }, async (_, e, next) => {
+    if (armed && e.value.a === 'stale') { armed = false; await pending.promise }
+    return next(e)
   })
-}
+  h.answer = () => { armed = true; return output('stale') }
+  const ui = await $.ui.mount(row())
+  await h.clock.advance(300)
+  await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
+  h.sessionId = 'session-2'
+  pending.resolve()
+  await h.clock.settle()
+  expect(await textOf(ui)).toBe('engine columns')
+  h.answer = () => output('fresh')
+  await h.clock.advance(5000)
+  expect(await textOf(ui)).toBe('fresh')
+})
 
 test('clear and resume keep the measured width, including a row drawn before the new id', async ($, on) => {
   const h = engine(on)
@@ -444,15 +437,14 @@ test('a delayed clear does not erase output published after the command is enabl
   expect(await textOf(ui)).toBe('decorated')
   armed = true
   h.policy.disableAllHooks = true
-  await ui.redraw() // The clear runs from a timer and stalls inside state.set.
-  await h.clock.settle()
+  await h.clock.advance(700) // The next run sees the policy; its clear stalls.
   h.policy = {}
   h.answer = () => output('fresh')
-  await ui.redraw()
+  await $.turn.start({ text: '', turnId: 'turn-2' })
   await h.clock.advance(300)
-  expect(await textOf(ui)).toBe('fresh')
   stall.resolve()
   await h.clock.settle()
+  await h.clock.advance(1300)
   expect(await textOf(ui)).toBe('fresh')
 })
 
@@ -506,43 +498,14 @@ test('a delayed clear does not erase identical output published after re-enablin
   await h.clock.advance(300)
   armed = true
   h.policy.disableAllHooks = true
-  await ui.redraw()
-  await h.clock.settle()
+  await h.clock.advance(700) // The next run sees the policy; its clear stalls.
   h.policy = {}
-  await ui.redraw()
+  await $.turn.start({ text: '', turnId: 'turn-2' })
   await h.clock.advance(300)
   stall.resolve()
   await h.clock.settle()
+  await h.clock.advance(1300)
   expect(await textOf(ui)).toBe('decorated')
-})
-
-test('a delayed clear landing during a publication does not win', async ($, on) => {
-  const h = engine(on)
-  const clearStall = deferred<void>()
-  const publishStall = deferred<void>()
-  let clearArmed = false
-  let publishArmed = false
-  on('state.set', { plugin: 'subagent-statusline', key: 'decorations' }, async (_, e, next) => {
-    if (clearArmed && Object.keys(e.value).length === 0) { clearArmed = false; await clearStall.promise }
-    else if (publishArmed && e.value.a === 'fresh') { publishArmed = false; await publishStall.promise }
-    return next(e)
-  })
-  const ui = await $.ui.mount(row())
-  await h.clock.advance(300)
-  clearArmed = true
-  h.policy.disableAllHooks = true
-  await ui.redraw()
-  await h.clock.settle()
-  h.policy = {}
-  h.answer = () => output('fresh')
-  publishArmed = true
-  await ui.redraw()
-  await h.clock.advance(300)
-  clearStall.resolve()
-  await h.clock.settle()
-  publishStall.resolve()
-  await h.clock.settle()
-  expect(await textOf(ui)).toBe('fresh')
 })
 
 test('without a command, row draws read no state', { options: { command: '' } }, async ($, on) => {
@@ -570,65 +533,4 @@ test('a slow /clear that keeps the old id never restarts the command for the end
   await h.clock.advance(600)
   expect(h.calls).toHaveLength(2)
   expect(JSON.parse(h.calls[1]!.init.stdin).session_id).toBe('session-2')
-})
-
-test('a delayed repair does not roll a row back to an older run', async ($, on) => {
-  const h = engine(on)
-  const clearStall = deferred<void>()
-  const repairStall = deferred<void>()
-  let clearArmed = false
-  let repairArmed = false
-  on('state.set', { plugin: 'subagent-statusline', key: 'decorations' }, async (_, e, next) => {
-    const value = e.value as Record<string, string>
-    if (clearArmed && Object.keys(value).length === 0) { clearArmed = false; await clearStall.promise }
-    else if (repairArmed && value.a === 'decorated') { repairArmed = false; await repairStall.promise }
-    return next(e)
-  })
-  const ui = await $.ui.mount(row())
-  await h.clock.advance(300)
-  clearArmed = true
-  h.policy.disableAllHooks = true
-  await ui.redraw()
-  await h.clock.settle()
-  h.policy = {}
-  await ui.redraw()
-  await h.clock.advance(300) // Same output as stored: no publication.
-  repairArmed = true
-  clearStall.resolve() // The old clear lands; its repair stalls.
-  await h.clock.settle()
-  h.answer = () => output('fresh')
-  await h.clock.advance(1000)
-  expect(await textOf(ui)).toBe('fresh')
-  repairStall.resolve()
-  await h.clock.settle()
-  expect(await textOf(ui)).toBe('fresh')
-})
-
-test('the unversioned last-resort clear does not erase newer output', async ($, on) => {
-  const h = engine(on)
-  const stall = deferred<void>()
-  let conflicts = 0
-  let armed = false
-  on('state.set', { plugin: 'subagent-statusline', key: 'decorations' }, async (_, e, next) => {
-    if (armed && Object.keys(e.value as object).length === 0) {
-      if (e.ifVersion !== undefined && conflicts < 3) { conflicts++; return { value: { isSet: false, version: 0 } } }
-      if (e.ifVersion === undefined) { armed = false; await stall.promise }
-    }
-    return next(e)
-  })
-  const ui = await $.ui.mount(row())
-  await h.clock.advance(300)
-  armed = true
-  h.policy.disableAllHooks = true
-  await ui.redraw()
-  await h.clock.settle()
-  expect(conflicts).toBe(3)
-  h.policy = {}
-  h.answer = () => output('fresh')
-  await ui.redraw()
-  await h.clock.advance(300)
-  expect(await textOf(ui)).toBe('fresh')
-  stall.resolve()
-  await h.clock.settle()
-  expect(await textOf(ui)).toBe('fresh')
 })

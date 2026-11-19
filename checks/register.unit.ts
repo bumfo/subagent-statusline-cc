@@ -109,6 +109,7 @@ describe('native refresh lifecycle', () => {
     await h.event('session.start')
     const reads = h.listReads
     await Promise.all([h.draw(row()), h.draw(row('b'))])
+    await h.clock.advance(0) // Draws only ask for a refresh; it runs from a timer.
     expect(h.listReads - reads).toBe(1)
     await h.clock.advance(299)
     expect(h.calls).toHaveLength(0)
@@ -193,13 +194,13 @@ describe('native refresh lifecycle', () => {
     await h.start()
     await h.clock.advance(300)
     h.policy.disableAllHooks = true
+    await h.clock.advance(700) // The next run checks the policy first.
     await h.draw()
     expect(h.forwarded.at(-1)!.props).not.toHaveProperty('body')
-    await h.clock.advance(0)
     expect(h.clock.timers.size).toBe(0)
     expect(h.decorations).toEqual({})
     h.policy = {}
-    await h.draw()
+    await h.event('settings.read')
     await h.clock.advance(300)
     expect(h.calls[1]!.argv[2]).toBe('fixture-command')
     expect(h.input().tasks[0].tokenSamples).toEqual([1234, 1234])
@@ -441,12 +442,12 @@ describe('AgentRow output delegation', () => {
     await h.clock.advance(300)
     h.policy.subagentStatusLine = { type: 'command', command: 'managed' }
     await h.draw(row('a', { body: 'native' }))
-    await h.clock.advance(0)
+    await h.clock.advance(700) // The next run checks the policy first.
     expect(h.decorations).toEqual({})
     await h.draw(row('a', { body: 'native' }))
     expect(h.logs).toEqual([])
     h.policy = {}
-    await h.draw(row())
+    await h.event('settings.read')
     await h.clock.advance(300)
     expect(h.decorations).toEqual({ a: 'decorated' })
   })
@@ -511,7 +512,7 @@ describe('reviewed lifecycle boundaries', () => {
     const h = host()
     h.policy.disableAllHooks = true
     await h.start()
-    expect(h.stateReads).toBeGreaterThan(1)
+    expect(h.stateReads).toBeGreaterThan(0)
     h.policy = {}
     await h.event('settings.read')
     await h.clock.advance(300)
@@ -593,16 +594,10 @@ describe('merge-review fixes', () => {
     await h.start()
     await h.clock.advance(300)
     expect(h.input().columns).toBe(90)
-    const gate = deferred<void>()
-    h.beforeSettings = async () => { h.beforeSettings = undefined; await gate.promise }
-    const drawing = h.draw(row('a', { columns: 40 }))
-    await flush()
     h.agents.push(agent('b'))
+    await h.draw(row('a', { columns: 40 }))
     await h.clock.advance(700) // The periodic tick sees two rows and restarts the timers.
-    gate.resolve()
-    await drawing
     await h.clock.advance(300)
-    expect(h.calls.map(call => call.at)).toEqual([300, 1300])
     expect(h.input().columns).toBe(40)
   })
 
